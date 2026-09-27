@@ -18,7 +18,7 @@ from pathlib import Path
 
 import duckdb
 
-from radar import config, entities, scoring_view, signals
+from radar import config, entities, scoring_view, signals, writer_id, g_record
 from radar.snapshots import utcnow
 
 RUNS_DIR = config.DATA_DIR / "runs"
@@ -64,6 +64,17 @@ def load_weights(path: Path, lock: Path | None, overrides: dict, params_sha: str
     return cfg, h, derived_sha
 
 
+EMPTY_LOOKUPS = """CREATE TABLE lookups(address TEXT, status TEXT, capped BOOLEAN, cap_block BIGINT, from_block BIGINT,
+    to_block BIGINT, subranges_json TEXT)"""
+EMPTY_LOOKUP_Y = "CREATE TABLE lookup_y(address TEXT, y TEXT, first_block BIGINT)"
+EMPTY_EXPANSIONS = """CREATE TABLE expansions(proxy_wallet TEXT, direction TEXT, hop INT, parent TEXT, address TEXT, status TEXT,
+    n_logs BIGINT, to_block_ts BIGINT, gap_free BOOLEAN, has_child_edges BOOLEAN)"""
+WRITER_PINS = config.APP_DIR.parent / "ledger" / "WRITER_PINS.md"
+G_RECORDS = config.APP_DIR.parent / "ledger" / "G_RECORDS.md"   # S6 v3: QA-recorded G records (the only G5-eligible ledger)
+# S4 input of record (QA 2026-09-27: G2E r3a cleared): results/G2E_event_times_2026-09-26_r3a.csv. The scorer hash-checks it.
+G2E_EVENT_TIMES_SHA256 = "60d2c1733733bb5741f187723bd2f869b08261056fb94e03b91b41e481fb8229"
+
+
 def build_inputs(con, snap: Path, prof: Path | None, bypass: list[str], anchors, shuffle_seed, relay_requires_decode=True):
     scoring_view.build_scoring_views(con, snap)
     D = (snap / "derived").as_posix()
@@ -105,14 +116,29 @@ def build_inputs(con, snap: Path, prof: Path | None, bypass: list[str], anchors,
                 CASE WHEN shape = 'relay_hub' AND {str(bool(relay_requires_decode)).upper()} THEN 'relay_hub_unverified' ELSE shape END AS shape
                 FROM '{PD}/redeems.parquet'""")
         con.execute(f"CREATE VIEW trade_after AS SELECT proxy_wallet, condition_id, to_timestamp(next_trade_unix) AS next_trade_ts FROM '{PD}/trade_after.parquet'")
-        con.execute(f"CREATE VIEW transfers AS SELECT proxy_wallet, direction, hop, counterparty FROM '{PD}/transfers.parquet'")
+        con.execute(f"""CREATE VIEW transfers AS SELECT proxy_wallet, direction, hop, counterparty, via, selected, stop_listed,
+            to_timestamp(first_ts_unix) AS first_ts, first_block FROM '{PD}/transfers.parquet'""")
+        if (prof / "derived" / "lookups.parquet").exists():   # S6 v3 activity lookups (params v3 [fetch] activity_lookup)
+            con.execute(f"""CREATE VIEW lookups AS SELECT address, status, capped, cap_block, from_block, to_block, subranges_json
+                FROM '{PD}/lookups.parquet'""")
+            con.execute(f"CREATE VIEW lookup_y AS SELECT address, y, first_block FROM '{PD}/lookup_y.parquet'")
+        else:   # no lookups -> every shared counterparty incomplete -> no link (and NA activity_unverified below 1.0)
+            con.execute(EMPTY_LOOKUPS); con.execute(EMPTY_LOOKUP_Y)
+        if (prof / "derived" / "expansions.parquet").exists():
+            con.execute(f"""CREATE VIEW expansions AS SELECT proxy_wallet, direction, hop, parent, address, status, n_logs,
+                to_block_ts, gap_free, has_child_edges FROM '{PD}/expansions.parquet'""")
+        else:   # no fetch records -> every expansion unrecorded -> negatives NA transfers_unverified (F-4)
+            con.execute(EMPTY_EXPANSIONS)
     else:
         con.execute("""CREATE TABLE wallet_profile(proxy_wallet TEXT, first_trade_ts TIMESTAMPTZ, first_funding_ts TIMESTAMPTZ,
             lifetime_volume_usdc DOUBLE, activity_status TEXT, stats_status TEXT, transfers_status TEXT, t_snap TIMESTAMPTZ,
             funding_truncated BOOLEAN, lower_bound_ts TIMESTAMPTZ)""")
         con.execute("CREATE TABLE redeems(proxy_wallet TEXT, condition_id TEXT, ts TIMESTAMPTZ, shape TEXT)")
         con.execute("CREATE TABLE trade_after(proxy_wallet TEXT, condition_id TEXT, next_trade_ts TIMESTAMPTZ)")
-        con.execute("CREATE TABLE transfers(proxy_wallet TEXT, direction TEXT, hop INT, counterparty TEXT)")
+        con.execute("""CREATE TABLE transfers(proxy_wallet TEXT, direction TEXT, hop INT, counterparty TEXT, via TEXT,
+            selected BOOLEAN, stop_listed BOOLEAN, first_ts TIMESTAMPTZ, first_block BIGINT)""")
+        con.execute(EMPTY_EXPANSIONS)
+        con.execute(EMPTY_LOOKUPS); con.execute(EMPTY_LOOKUP_Y)
     con.execute("CREATE TABLE stop_list(address TEXT)")
     con.executemany("INSERT INTO stop_list VALUES (?)", [[r[0]] for r in entities.rows()])
     con.execute("CREATE TABLE bypass(proxy_wallet TEXT)")
@@ -158,9 +184,42 @@ def recompute_check(con, applied):
 def run(snap: Path, weights_path: Path, params_path: Path, prof: Path | None = None, bypass_path: Path | None = None,
         event_times: Path | None = None, overrides: dict | None = None, tag: str | None = None,
         shuffle_seed: int | None = None, s6_edges=("in", "out"), lock: Path | None = None, runs_dir: Path = RUNS_DIR,
-        base_run_id: str | None = None, params_lock: Path | None = None, threads: int = DUCKDB_THREADS) -> dict:
+        base_run_id: str | None = None, params_lock: Path | None = None, threads: int = DUCKDB_THREADS,
+        pins: Path = WRITER_PINS, g_record_path: Path | None = None, g_records: Path = G_RECORDS,
+        event_times_sha: str | None = None) -> dict:
     overrides = overrides or {}
     P, params_sha, _ = load_params(params_path, params_lock)
+    prof_gate = None
+    if prof is not None:
+        try:   # r15 Δ26/Δ29, QA C2/C3: every files[] writer_id pinned in WRITER_PINS.md; no PROF-001 file
+            prof_gate = writer_id.check_profile(Path(prof), Path(pins), Path(prof).parent)
+        except writer_id.WriterError as e:
+            raise ScoreError(f"profile refused: {e}") from e
+    # live as-of instant t for path completeness (r14 Δ20): the SNAP instant
+    snap_man = json.loads((snap / "manifest.json").read_bytes())
+    fin = snap_man.get("finished_at")
+    if not fin:        # QA N1: no as-of instant -> refuse (t = 0 would make every completeness check trivially true)
+        raise ScoreError("SNAP manifest has no finished_at: no as-of instant t (refusing t = 0)")
+    P["_t_asof_unix"] = int(datetime.fromisoformat(fin.replace("Z", "+00:00")).timestamp())
+    g_meta, ineligible = None, []
+    snap_sha = sha_bytes((snap / "manifest.json").read_bytes())
+    if P.get("s6_rule") == "C1":   # params v3: G only from a QA-recorded G record; block(t) = the profile's snap_block
+        if prof is None:
+            P["_s6_G"], P["_block_t"] = 0, 0          # no profile: every profiled wallet is S6 NA transfers_unavailable
+        else:
+            try:
+                g_meta = g_record.check(g_record_path, g_records, Path(prof), params_sha, snap_sha)
+            except g_record.GRecordError as e:
+                raise ScoreError(f"S6 v3 refused: {e}") from e
+            pman = json.loads((Path(prof) / "manifest.json").read_bytes())
+            PDd = Path(prof) / "derived"      # V1-6: a v3 profile is hop-1 only; hop >= 2 data must not exist, let alone be read
+            n_deep = sum(duckdb.connect().execute(f"SELECT count(*) FROM '{(PDd / f).as_posix()}' WHERE hop >= 2").fetchone()[0]
+                         for f in ("transfers.parquet", "expansions.parquet") if (PDd / f).exists())
+            if n_deep:
+                raise ScoreError(f"S6 v3 refused: the profile has {n_deep} hop >= 2 rows (params v3 fetches hop 1 only)")
+            if int(pman.get("snap_instant_unix", -1)) != P["_t_asof_unix"]:
+                raise ScoreError("profile snap_block was resolved for a different SNAP instant")
+            P["_s6_G"], P["_block_t"] = g_meta["G"], g_meta["block_t"]
     cfg, base_sha, wsha = load_weights(weights_path, lock, overrides, params_sha)
     bypass, bmeta = [], None
     if bypass_path:
@@ -172,7 +231,12 @@ def run(snap: Path, weights_path: Path, params_path: Path, prof: Path | None = N
         bypass = sorted({r[col].strip().lower() for r in rd if (r[col] or "").strip()})
         bmeta = {"path": str(bypass_path), "sha256": sha_bytes(raw), "rows": len(bypass)}
     anchors, emeta = [], None
-    if event_times:
+    if event_times:                   # QA: S4 reads only the input of record (G2E r3a); another file only with an explicit override
+        esha = sha_bytes(Path(event_times).read_bytes())
+        if esha != (event_times_sha or G2E_EVENT_TIMES_SHA256):
+            raise ScoreError(f"event-times file sha {esha[:12]}… is not the S4 input of record")
+        if event_times_sha and event_times_sha != G2E_EVENT_TIMES_SHA256:
+            ineligible.append("event-times pin overridden (test)")
         from radar import events
         anchors, emeta = events.load_anchors(event_times, P["s4_lead_h"])
     con = duckdb.connect()
@@ -185,7 +249,21 @@ def run(snap: Path, weights_path: Path, params_path: Path, prof: Path | None = N
     con.execute("ALTER TABLE signals_dense ADD COLUMN params_hash TEXT")
     con.execute("UPDATE signals_dense SET params_hash = ?", [params_sha])
     applied, pre, computable = score(con, cfg["weights"])
+    # r13 Δ14 / r15 Δ32 report: per scope, S1/S6 NA reasons and path flags (counted, never hidden)
+    path_counts = {sc: {"s1_transfers_unverified": a, "s6_transfers_unverified": b, "s6_breadth_truncated": c,
+                        "s6_positive_on_incomplete_path": d, "s6_positive_on_breadth_truncated_path": e, "hub_capped_wallets": f}
+                   for sc, a, b, c, d, e, f in con.execute("""SELECT d.scope,
+            count(*) FILTER (WHERE d.signal_id = 'S1' AND d.na_reason = 'transfers_unverified'),
+            count(*) FILTER (WHERE d.signal_id = 'S6' AND d.na_reason = 'transfers_unverified'),
+            count(*) FILTER (WHERE d.signal_id = 'S6' AND d.na_reason = 'breadth_truncated'),
+            count(*) FILTER (WHERE d.signal_id = 'S6' AND d.raw_value > 0 AND d.evidence_json LIKE '%"incomplete_path": true%'),
+            count(*) FILTER (WHERE d.signal_id = 'S6' AND d.raw_value > 0 AND d.evidence_json LIKE '%"breadth_truncated_path": true%'),
+            count(*) FILTER (WHERE d.signal_id = 'S6' AND d.evidence_json LIKE '%"hub_capped":%')
+        FROM signals_dense d GROUP BY 1 ORDER BY 1""").fetchall()}
     recompute_check(con, applied)
+    if P.get("s6_rule") == "C1" and prof is not None and Path(g_records).resolve() != G_RECORDS.resolve():
+        ineligible.append(f"non-default G ledger {Path(g_records).name} (R15V3-4)")    # a self-made ledger can pass the gate: never G5
+    s6v3_counts = con.execute("SELECT * FROM s6v3_counts ORDER BY scope").fetchall() if P.get("s6_rule") == "C1" else []
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{stamp}-{wsha[:8]}" + (f"+{tag}" if tag else "")
     out = runs_dir / run_id
@@ -310,6 +388,14 @@ def run(snap: Path, weights_path: Path, params_path: Path, prof: Path | None = N
         "scope_limit_text": f"wallets without >= {P['pre_min_stake']} USDC of buys below {P['p_low']} were not profiled (S1/S2/S6/S8 = NA)",
         "derived": derived,
         "duckdb_threads": con.execute("SELECT current_setting('threads')").fetchone()[0],
+        "profile_gate": prof_gate, "t_asof_unix": P["_t_asof_unix"], "profile_path_counts": path_counts,
+        "g5_eligible": not ineligible, "g5_ineligible_reasons": ineligible,
+        "s6_v3": None if P.get("s6_rule") != "C1" else {
+            "ledger": {"path": str(g_records), "sha256": sha_bytes(Path(g_records).read_bytes()) if Path(g_records).exists() else None},
+            "g_record": g_meta, "block_t": P["_block_t"], "G": P["_s6_G"], "edge_mode": list(s6_edges),
+            "counts": {r[0]: dict(zip(["n_lookup_set", "n_lookup_complete", "n_lookup_incomplete", "n_capped_at_t", "n_activity_unverified",
+                                       "n_transfers_unverified", "n_s6_positive", "n_s6_positive_on_incomplete_path"], r[1:]))
+                       for r in s6v3_counts}},
         "numerics": "exact DECIMAL sums: size DECIMAL(38,6), price DECIMAL(38,10), stake DECIMAL(38,16); DOUBLE at output",
     }
     body = json.dumps(runrec, indent=1, sort_keys=True, default=str).encode()
@@ -335,6 +421,10 @@ def main(argv=None):
     ap.add_argument("--s6-edges", default="in,out")
     ap.add_argument("--threads", type=int, default=DUCKDB_THREADS, help="DuckDB threads (gate run C uses 4; default 1)")
     ap.add_argument("--runs-dir", default=None)
+    ap.add_argument("--pins", default=str(WRITER_PINS), help="QA-held WRITER_PINS.md (profile writer pins)")
+    ap.add_argument("--g-record", default=None, help="S6 v3: the G record written by tools/derive_g.py (must be QA-recorded)")
+    ap.add_argument("--g-records", default=str(G_RECORDS), help="QA-held G_RECORDS.md ledger (any other path -> g5_eligible = false)")
+    ap.add_argument("--event-times-sha", default=None, help="TEST ONLY: accept another event-times file (run becomes non-G5)")
     a = ap.parse_args(argv)
     ov = dict(o.split("=", 1) for o in a.override)
     if (ov or a.shuffle_seed is not None or a.s6_edges != "in,out") and not a.tag:
@@ -345,7 +435,8 @@ def main(argv=None):
               Path(a.event_times) if a.event_times else None, ov, a.tag, a.shuffle_seed, tuple(a.s6_edges.split(",")),
               Path(a.lock) if a.lock else w.with_suffix(w.suffix + ".lock"), base_run_id=a.base_run,
               params_lock=Path(a.params_lock) if a.params_lock else pp.with_suffix(pp.suffix + ".lock"),
-              runs_dir=Path(a.runs_dir) if a.runs_dir else RUNS_DIR, threads=a.threads)
+              runs_dir=Path(a.runs_dir) if a.runs_dir else RUNS_DIR, threads=a.threads, pins=Path(a.pins),
+              g_record_path=Path(a.g_record) if a.g_record else None, g_records=Path(a.g_records), event_times_sha=a.event_times_sha)
     print(json.dumps(out, indent=1, default=str))
 
 

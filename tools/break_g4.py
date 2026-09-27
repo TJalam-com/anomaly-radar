@@ -19,7 +19,7 @@ MUTATIONS = [  # (name, old, new, test[, file])
      "FROM signal_fills f JOIN scope_map s USING (condition_id) WHERE f.walk = 'all' AND f.side = 'BUY' GROUP BY 1, 2)",
      "test_s2_concentration_both_sides"),
     ("S6 stop-list ignored", "AND t.counterparty NOT IN (SELECT address FROM stop_list)", "", "test_s6_stop_list_and_fanout"),
-    ("S6 edge-direction flag ignored", "WHERE t.direction IN ({dirs})", "WHERE TRUE", "test_s6_in_and_out"),
+    ("S6 edge-direction flag ignored", "WHERE t.direction IN ({dirs}) AND t.hop <=", "WHERE TRUE AND t.hop <=", "test_s6_in_and_out"),
     ("S8 tx-shape check dropped", 'elif shape not in P.get("_user_signed_shapes", USER_SIGNED_SHAPES):', "elif False:", "test_s8_exit_behaviour"),
     ("prefilter single-leg max instead of Σ", "SELECT f.proxy_wallet, sum({stake()}) AS s3_set_raw",
      "SELECT f.proxy_wallet, max({stake()}) AS s3_set_raw", "test_prefilter_bypass_and_density"),
@@ -37,10 +37,17 @@ MUTATIONS = [  # (name, old, new, test[, file])
      "test_g4_score.py::test_shuffle_mode_breaks_timing_keeps_s3", "score"),
 ]
 MUTATIONS += [
-    ("S1 truncation rule ignored", "        if trunc:\n            # QA funding-window rule (corrected)",
-     "        if False:\n            # QA funding-window rule (corrected)", "test_s1_funding_window_truncation"),
-    ("S1 truncated -> always first_trade (rejected rule)", "if ftt is not None and lb_ts is not None and ftt < lb_ts:", "if ftt is not None:",
+    ("S1 truncation rule ignored", "        elif trunc:\n            # QA funding-window rule (corrected)",
+     "        elif False:\n            # QA funding-window rule (corrected)", "test_s1_funding_window_truncation"),
+    ("S1 truncated -> always first_trade (rejected rule)",
+     "search window\n            if ftt is not None and lb_ts is not None and ftt < lb_ts:", "search window\n            if ftt is not None:",
      "test_s1_funding_window_truncation"),
+    ("S1 incomplete hop-1 -> always first_trade (fallback active at bound 0)",
+     "(inactive while the bound is 0).\n            if ftt is not None and lb_ts is not None and ftt < lb_ts:",
+     "(inactive while the bound is 0).\n            if ftt is not None:",
+     "test_s1_uses_funding_only_from_complete_hop1_in"),
+    ("path_flags edge-direction ignored", "tr AS (SELECT t.* FROM transfers t JOIN prof USING (proxy_wallet) WHERE t.direction IN ({dirs}))",
+     "tr AS (SELECT t.* FROM transfers t JOIN prof USING (proxy_wallet) WHERE TRUE)", "test_path_flags_respect_edge_direction"),
     ("S6 incomplete flag dropped", 'ev["edges_possibly_incomplete"] = True', "pass", "test_s1_funding_window_truncation"),
     ("S8 frozen shapes ignored (default incl. relay_hub)", 'elif shape not in P.get("_user_signed_shapes", USER_SIGNED_SHAPES):',
      'elif shape not in ("safe_exec", "relay_hub", "direct_eoa"):', "test_s8_relay_hub_not_user_signed_under_frozen_shapes"),
@@ -119,7 +126,7 @@ MUTATIONS += [
      "test_gate.py::test_determinism_gate_passes", "score", [("signals", STAKE_EXACT, STAKE_FLOAT), ("signals", SZ_EXACT, SZ_FLOAT)]),
     # selection gate (i): unseeded resample -> the two selection processes write different JSONL
     ("selection gate (i): unseeded bootstrap resample", "    rng = random.Random(seed)", "    rng = random.Random()",
-     "test_g4_weights_search.py::test_selection_gate_passes_and_base_run_is_gated", "search"),
+     "test_g4_weights_search.py::test_bootstrap_rng_is_constructed_with_the_given_seed", "search"),   # deterministic target (QA)
     ("signed zero not canonicalised", 'float(r[2]) + 0.0 for r in rows', 'float(r[2]) for r in rows',
      "test_no_signed_zero_in_outputs"),
     ("export signed zero (signals) not canonicalised", "REPLACE (raw_value + 0.0 AS raw_value, component + 0.0 AS component)",
@@ -134,17 +141,132 @@ MUTATIONS += [
     ("chain check: comparison sides swapped", "        miss_api = chain - apiw      # on chain, not in API",
      "        miss_api = apiw - chain      # on chain, not in API", "test_chain_fill_check.py::test_detection_api_row_removed", "cfc",
      [("cfc", "        miss_chain = apiw - chain    # in API, not on chain", "        miss_chain = chain - apiw    # in API, not on chain")]),
+    # ---- r15 build (r13 Δ14, r14 Δ20/Δ21/Δ22, r15 Δ24–Δ30, QA C1–C5)
+    ("path: S6 incomplete check dropped", "        elif linked == 0 and incomplete:          # a negative needs every path expansion complete (F-4); C5: wins",
+     "        elif False:", "test_s6_negative_needs_complete_path"),
+    ("path: missing fetch record not counted", "UNION SELECT proxy_wallet FROM missing", "",
+     "test_selected_counterparty_without_fetch_record_is_incomplete"),
+    ("path: to_block_ts not checked", "AND coalesce(to_block_ts, 0) >= {t}) AS complete", ") AS complete",
+     "test_s6_negative_needs_complete_path"),
+    ("path: hub kept in C(X)", """                   AND NOT EXISTS (SELECT 1 FROM hub h WHERE h.proxy_wallet = tr.proxy_wallet AND h.direction = tr.direction
+                                   AND h.hop = tr.hop + 1 AND h.address = tr.counterparty)),""", "),",
+     "test_hub_capped_counterparty_is_no_na_and_counted"),
+    ("path: hub treated as an incomplete expansion", "                 FROM ex WHERE status <> 'hub'),", "                 FROM ex),",
+     "test_hub_capped_counterparty_is_no_na_and_counted"),
+    ("path: breadth_truncated wins over transfers_unverified",
+     "        elif linked == 0 and incomplete:          # a negative needs every path expansion complete (F-4); C5: wins",
+     "        elif linked == 0 and incomplete and not btrunc:", "test_precedence_unverified_over_breadth_truncated"),
+    ("S1: funding from an incomplete hop-1 expansion", "        if not hop1_ok:", "        if False:",
+     "test_s1_uses_funding_only_from_complete_hop1_in"),
+    ("writer: sub-range contiguity dropped", 'all(b["from"] == a["to"] + 1 for a, b in zip(subs, subs[1:]))', "True",
+     "test_g4_profile_events.py::test_gap_free_plants", "profile"),
+    ("writer: follow by arrival order", 'key=lambda cp: (-agg[cp]["amount_raw"], agg[cp]["first_block"] or 0, agg[cp]["log_index"], cp))',
+     'key=lambda cp: -agg[cp]["amount_raw"])', "test_g4_profile_events.py::test_follow_rule_independent_of_rpc_order", "profile"),
+    ("writer: writer_id over profile.py only", 'if (name == "radar" or name.startswith("radar.")) and f:', 'if name == "radar.profile" and f:',
+     "test_g4_profile_events.py::test_writer_id_covers_every_module_in_closure", "writer"),
+    ("writer: pins accepted for any PROF id", "return {wid for prof, wid, _ in read_pins(pins_path) if prof == prof_id}",
+     "return {wid for prof, wid, _ in read_pins(pins_path)}", "test_g4_profile_events.py::test_pins_parse_and_refuse", "writer"),
+    ("writer: start without pin check", "    pins_sha = wid_mod.require_pinned(Path(a.pins), a.prof_id, WID)", "    pins_sha = None",
+     "test_g4_profile_events.py::test_writer_refuses_to_start_unpinned", "profile"),
+    ("reader: PROF-001 files accepted", "        if old:\n", "        if False:\n",
+     "test_g4_score.py::test_reader_refuses_missing_writer_id_and_prof001_files", "writer"),
+    ("reader: missing writer_id accepted", 'bad = [f["path"] for f in files if f.get("writer_id") not in pins]',
+     'bad = [f["path"] for f in files if f.get("writer_id") not in pins | {None}]',
+     "test_g4_score.py::test_reader_refuses_missing_writer_id_and_prof001_files", "writer"),
+    ("reader: integrity check dropped", 'if not p.exists() or _sha(p) != f["sha256"]:', "if not p.exists():",
+     "test_g4_score.py::test_reader_refuses_tampered_file", "writer"),
     ("gate: check (ii) ignored", "    ok_ii = all(v[\"equal\"] for v in check_ii.values())", "    ok_ii = True",
      "test_gate.py::test_gate_fails_and_voids_on_difference", "gate"),
 ]
+# ---- r15 + S6 v3 fold-in (r15v3_prep FROZEN_MANIFEST e330b2dd..., Tester 1 cleared): the prep mutants, + QA N1/N2/N4
+MUTATIONS += [
+    ('partners counted over all profiled', 'others = (by_x[x] & natural) - {w}', 'others = by_x[x] - {w}', 'test_s6_v3.py', 'signals'),
+    ('lookup set without the >=1 natural condition', 'if len(ws) >= 2 and ws & natural}', 'if len(ws) >= 2}', 'test_s6_v3.py', 'signals'),
+    ('activity <= G -> < G', 'if act is not None and act <= G:', 'if act is not None and act < G:', 'test_s6_v3.py', 'signals'),
+    ('incomplete lookup treated as complete', 'if r is not None and knee_g.complete_at(r, bt):', 'if r is not None:', 'test_s6_v3.py', 'signals'),
+    ('activity_unverified rule removed', 'elif unverified and comp < 1.0:', 'elif False:', 'test_s6_v3.py', 'signals'),
+    ('activity_unverified applied even at component 1.0', 'elif unverified and comp < 1.0:', 'elif unverified:', 'test_s6_v3.py', 'signals'),
+    ('transfers_unverified applied even at component 1.0', 'elif own_incomplete and comp < 1.0:', 'elif own_incomplete:', 'test_s6_v3.py', 'signals'),
+    ('F-4 literal (value + flag) for own-incomplete partial positives', 'elif own_incomplete and comp < 1.0:', 'elif own_incomplete and linked == 0:', 'test_s6_v3.py', 'signals'),
+    ('precedence swapped (activity before transfers unverified)', '            elif own_incomplete and comp < 1.0:\n                res = (None, None, "transfers_unverified", {})\n            elif unverified and comp < 1.0:\n                res = (None, None, "activity_unverified", {})', '            elif unverified and comp < 1.0:\n                res = (None, None, "activity_unverified", {})\n            elif own_incomplete and comp < 1.0:\n                res = (None, None, "transfers_unverified", {})', 'test_s6_v3.py', 'signals'),
+    ('edge cut block <= -> <', 'AND t.first_block <= {bt}', 'AND t.first_block < {bt}', 'test_s6_v3.py', 'signals'),
+    ('edge cut ignored (SNAP edges in a replay cell)', 'AND t.first_block IS NOT NULL AND t.first_block <= {bt}', 'AND TRUE', 'test_s6_v3.py', 'signals'),
+    ('graded component -> linked / 5', 'comp = graded(linked, K)', 'comp = min(1.0, linked / 5)', 'test_s6_v3.py', 'signals'),
+    ('positive-on-incomplete-path counter not incremented', 'c["n_s6_positive_on_incomplete_path"] += bool(raw) and bool(ev.get("incomplete_path"))', 'c["n_s6_positive_on_incomplete_path"] += 0', 'test_s6_v3.py', 'signals'),
+    ('recorded-G requirement removed', 'if "_s6_G" not in P or "_block_t" not in P or', 'if False and "_block_t" not in P or', 'test_s6_v3.py', 'signals'),
+    ('as-of activity ignores block(t)', 'return sum(1 for b in fb if b <= int(block_t))', 'return len(list(fb))', 'test_s6_v3.py', 'knee_g'),
+    ('capped regardless of cap_block', 'return bool(record["capped"]) and record["cap_block"] is not None and record["cap_block"] <= int(block_t)', 'return bool(record["capped"])', 'test_s6_v3.py', 'knee_g'),
+    ('precomputed activity accepted (as-of rule bypassable)', 'if "first_blocks" not in record:', 'if False:', 'test_s6_v3.py', 'knee_g'),
+    ('merge order: per-stream (outbound then inbound) instead of (block, log_index)', 'for k in sorted(merged):', 'for k in list(merged):', 'test_activity_lookup.py', 'activity'),
+    ('self-transfer counted as a counterparty', 'if y == X or y in first:', 'if y in first:', 'test_activity_lookup.py', 'activity'),
+    ('fetching continues after the cap', 'if st["capped"] or st["failed"]:', 'if st["failed"]:', 'test_activity_lookup.py', 'activity'),
+    ('block(T) non-strict (ts <= T)', 'if ts(mid) < t_unix:', 'if ts(mid) <= t_unix:', 'test_activity_lookup.py', 'activity'),
+    ('lookup set without the >=1 natural condition (fetch side)', 'if len(ws) >= 2 and nn >= 1:', 'if len(ws) >= 2:', 'test_activity_lookup.py', 'activity'),
+    ('stop list ignored in the lookup set', '        if x in stop:\n            continue', '        pass', 'test_activity_lookup.py', 'activity'),
+    ('uncapped record need not cover block(t)', 'return bool(rec["capped"]) or rec["to_block"] >= int(block_t)', 'return True', 'test_activity_lookup.py', 'knee_g'),
+    ('knee: mode tie -> highest bin', 'mode = h[:TERMINAL].index(top)', 'mode = TERMINAL - 1 - h[:TERMINAL][::-1].index(top)', 'test_knee_g_v3.py', 'knee_g'),
+    ('knee: drop < -> <=', 'if h[k] < DROP * h[k - 1]:', 'if h[k] <= DROP * h[k - 1]:', 'test_knee_g_v3.py', 'knee_g'),
+    ('knee: terminal-bin rule removed', 'if a is None or a >= 256:', 'if a is None:', 'test_knee_g_v3.py', 'knee_g'),
+    ('knee: clamp removed', 'return max(GMIN, min(GMAX, g)), mode', 'return g, mode', 'test_knee_g_v3.py', 'knee_g'),
+    ('knee: population over all sharers', 'r["n_natural_sharers"] >= 2', 'r["n_natural_sharers"] >= 0', 'test_knee_g_v3.py', 'knee_g'),
+    ('knee: incomplete records admitted', 'if r["complete"] and r["n_natural_sharers"]', 'if r["n_natural_sharers"]', 'test_knee_g_v3.py', 'knee_g'),
+    ('knee: first_block <= -> <', 'return sum(1 for b in fb if b <= int(block_t))', 'return sum(1 for b in fb if b < int(block_t))', 'test_knee_g_v3.py', 'knee_g'),
+    ('g_record: ledger membership not checked', '    if led is None:', '    if False:', 'test_g_record_v3.py', 'g_record'),
+    ('g_record: lookup/transfer inputs not bound', 'if rec.get("inputs", {}).get(f) != derived.get(f) or derived.get(f) is None or sha(Path(prof) / f) != derived[f]:', 'if False:', 'test_g_record_v3.py', 'g_record'),
+    ('g_record: params file not bound', 'if rec.get("params_sha256") != params_sha:', 'if False:', 'test_g_record_v3.py', 'g_record'),
+    ('g_record: snap_block not bound', 'if rec.get("snap_block") != man.get("snap_block"):', 'if False:', 'test_g_record_v3.py', 'g_record'),
+    ('g_record: ledger G not compared', 'if rec.get("G") != led["G"] or', 'if False or', 'test_g_record_v3.py', 'g_record'),
+    ('derive_g: post-SNAP edges counted as natural sharers', 'AND first_block IS NOT NULL AND first_block <= {bt}', 'AND TRUE', 'test_g_record_v3.py', 'derive_g'),
+    ('derive_g: natural filter removed', 'if w in natural and x != w:', 'if x != w:', 'test_g_record_v3.py', 'derive_g'),
+    ('score: G taken without the recorded-G check', 'g_meta = g_record.check(g_record_path, g_records, Path(prof), params_sha, snap_sha)', 'g_meta = {"G": 16, "block_t": 500}', 'test_g_record_v3.py', 'score'),
+    ('in-edge mode: flag ignored (all directions link)', '            if d in link_dirs:', '            if True:', 'test_s6_v3.py', 'signals'),
+    ("in-edge mode: lookup set from link edges only (not the default run's set)", 'L = {x for x, ws in by_x_all.items() if len(ws) >= 2 and ws & natural}', 'L = {x for x, ws in by_x.items() if len(ws) >= 2 and ws & natural}', 'test_s6_v3.py', 'signals'),
+    ('in-edge mode: G re-derived / altered', 'P["_s6_G"], P["_block_t"] = g_meta["G"], g_meta["block_t"]', 'P["_s6_G"], P["_block_t"] = (g_meta["G"] if tuple(s6_edges) == ("in", "out") else g_meta["G"] + 1), g_meta["block_t"]', 'test_g_record_v3.py', 'score'),
+    ('scorer: hop >= 2 guard removed', '            if n_deep:', '            if False:', 'test_g_record_v3.py', 'score'),
+    ('profile: v3 hop-1-only guard removed', 'if P.get("s6_rule") == "C1" and int(P["s6_max_hops"]) != 1:', 'if False:', 'test_profile_v3.py', 'profile'),
+    ('lookup: calls not counted', '        ins_["calls"] += 1', '        pass', 'test_profile_v3.py', 'activity'),
+    ('lookup: bisection cause not classified', 'ins_["splits"]["result_count" if ("result" in m or "more than" in m) else "span" if ("range" in m or "block" in m) else "other"] += 1', 'pass', 'test_profile_v3.py', 'activity'),
+    ('R15V3-1: replay-scope guard removed', '    if bad:\n        raise ValueError(f"S6 v3 has no per-cell', '    if False:\n        raise ValueError(f"S6 v3 has no per-cell', 'test_s6_v3.py', 'signals'),
+    ('R15V3-2: pre-fix fail-open (no t guard, t defaults to 0)', ' or "_t_asof_unix" not in P or P["_t_asof_unix"] is None:\n        raise ValueError("S6 v3 needs P[\'_s6_G\'] (recorded G), P[\'_block_t\'] (block(t)) and P[\'_t_asof_unix\'] (t; no default)")\n    G, bt, K, t = int(P["_s6_G"]), int(P["_block_t"]), float(P["s6_graded_k"]), int(P["_t_asof_unix"])', ':\n        raise ValueError("S6 v3 needs P[\'_s6_G\'] (recorded G), P[\'_block_t\'] (block(t))")\n    G, bt, K, t = int(P["_s6_G"]), int(P["_block_t"]), float(P["s6_graded_k"]), int(P.get("_t_asof_unix") or 0)', 'test_s6_v3.py', 'signals'),
+    ('R15V3-2: t requirement removed', ' or "_t_asof_unix" not in P or P["_t_asof_unix"] is None:', ':', 'test_s6_v3.py', 'signals'),
+    ('R15V3-5: no_transfers_found counts post-cut rows', 'AND first_block <= {bt} AND direction IN ({dl}) GROUP BY 1', 'AND direction IN ({dl}) GROUP BY 1', 'test_s6_v3.py', 'signals'),
+    ('R15V3-3: SNAP not bound in the G check', 'if not snap_rec or snap_rec != man.get("snap_manifest_sha256") or snap_rec != snap_manifest_sha:', 'if False:', 'test_g_record_v3.py', 'g_record'),
+    ('R15V3-4: non-default ledger still G5-eligible', 'if P.get("s6_rule") == "C1" and prof is not None and Path(g_records).resolve() != G_RECORDS.resolve():', 'if False:', 'test_g_record_v3.py', 'score'),
+    ('R15V3-6: duplicate sha with different fields accepted (last wins)', 'if prev is not None and {k: prev[k] for k in e} != e:', 'if False:', 'test_g_record_v3.py', 'g_record'),
+    ('R15V3-7: superseded records accepted', '    if led["superseded"]:', '    if False:', 'test_g_record_v3.py', 'g_record'),
+    ('R15V3-7: superseded computed as never', 'e["superseded"] = last[e["prof_id"]] != sha_', 'e["superseded"] = False', 'test_g_record_v3.py', 'g_record'),
+    ('S4 input of record not hash-checked', 'if esha != (event_times_sha or G2E_EVENT_TIMES_SHA256):', 'if False:', 'test_g_record_v3.py', 'score'),
+    ('S4 pin override not marked non-G5', 'if event_times_sha and event_times_sha != G2E_EVENT_TIMES_SHA256:', 'if False:', 'test_g_record_v3.py', 'score'),
+    ('S4: r3a header map removed', 'HEADER_MAP = {"event_ts_tz": "event_tz", "hedged_report_precision": "hedged_report_ts_precision"}', 'HEADER_MAP = {}', 'test_events_r3a.py', 'events'),
+    ('S4: inferred zone not floored (b ignored)', 'tz, _ = _tz("UNKNOWN" if inferred else g(tz_k))', 'tz, _ = _tz(g(tz_k))', 'test_events_r3a.py', 'events'),
+    ('S4: unknown columns accepted', '    if unknown:\n        raise EventFileError(f"event file has unknown columns', '    if False:\n        raise EventFileError(f"event file has unknown columns', 'test_events_r3a.py', 'events'),
+    ('S4: two headers mapping to one role accepted', '        if c in canon:\n', '        if False:\n', 'test_events_r3a.py', 'events'),
+    ('S4: non-boolean inferred flag read as false', '    raise EventFileError(f"column {col}: {s!r} is not a boolean; S4 refuses")', '    return False', 'test_events_r3a.py', 'events'),
+    ('S4: missing required column accepted', '    if missing:\n        raise EventFileError(f"event file lacks columns', '    if False:\n        raise EventFileError(f"event file lacks columns', 'test_events_r3a.py', 'events'),
+    ('tz: NAME(UTC+hh:mm) form not parsed (pre-fix)', 'm = re.fullmatch(r"(?:[A-Z]{2,5}\\s*\\()?\\s*(?:UTC|GMT)?', 'm = re.fullmatch(r"\\s*(?:UTC|GMT)?', 'test_events_r3a.py', 'events'),
+    ('tz: out-of-range offset accepted', '    if h > 14 or mm >= 60:\n        return unknown', '    if False:\n        return unknown', 'test_events_r3a.py', 'events'),
+    ('path_flags: t fail-open default restored', '    if P.get("_t_asof_unix") is None:     # QA: no fail-open default (t = 0 made every to_block_ts >= t trivially true)\n        raise ValueError("path_flags needs P[\'_t_asof_unix\'] (the as-of instant t)")\n    t = int(P["_t_asof_unix"])\n', '    t = int(P.get("_t_asof_unix") or 0)\n', 'test_s6_v3.py', 'signals'),
+    ('tz (real r3a): old parser restored (strip UTC, fail on the label)', '    m = re.fullmatch(r"(?:[A-Z]{2,5}\\s*\\()?\\s*(?:UTC|GMT)?\\s*([+-])(\\d{1,2})(?::?(\\d{2}))?\\s*\\)?", raw)', '    m = re.fullmatch(r"\\s*(?:UTC|GMT)?\\s*([+-])(\\d{1,2})(?::?(\\d{2}))?\\s*", raw)', 'test_events_r3a.py::test_real_r3a_stated_irst_anchors_are_0430z_and_known', 'events'),
+    ('in-edge mode: no_transfers_found counts all directions', 'AND first_block <= {bt} AND direction IN ({dl}) GROUP BY 1', 'AND first_block <= {bt} GROUP BY 1', 'test_s6_v3.py', 'signals'),
+    ('in-edge mode: own record checked in both directions', 'own_incomplete = not all(e.get(d) for d in link_dirs)', 'own_incomplete = not (e.get("in") and e.get("out"))', 'test_s6_v3.py', 'signals'),
+    ('finalize: lookup files left out of the manifest', 'for f in sorted((prof_dir / "lookups").glob("*.json")) if (prof_dir / "lookups").exists() else []:', 'for f in []:', 'test_profile_v3.py', 'profile'),
+    ('run_lookups: not resumable (re-fetches existing records)', '        if target.exists():\n            continue', '        pass', 'test_profile_v3.py', 'activity'),
+    ('N1: SNAP without finished_at gives t = 0', '    if not fin:        # QA N1', '    if False:        # QA N1', 'test_g4_score.py::test_scorer_refuses_a_snap_without_finished_at', 'score'),
+    ('N2: empty inferred flag next to a timestamp read as false', '            if g(ts_k) and not g(inf_k):', '            if False:', 'test_events_r3a.py::test_empty_inferred_flag_next_to_a_timestamp_is_refused', 'events'),
+    ('N4: projection uses p50 instead of the mean', '    mean = (sum(allc) / len(allc)) if allc else None', '    mean = out["calls_per_lookup_all"]["p50"]', 'test_profile_v3.py::test_dry_run_projection_uses_mean_with_p90_upper_and_p50', 'report'),
+    ('N4: quantile index floored (p90 not an upper bound)', 'math.ceil(f * (len(v) - 1))', 'int(f * (len(v) - 1))', 'test_profile_v3.py::test_dry_run_projection_uses_mean_with_p90_upper_and_p50', 'report'),
+]
 FILES = {"signals": APP / "radar" / "signals.py", "score": APP / "radar" / "score.py", "profile": APP / "radar" / "profile.py",
-         "gate": APP / "radar" / "gate.py",
+         "gate": APP / "radar" / "gate.py", "writer": APP / "radar" / "writer_id.py",
          "search": APP / "radar" / "weights_search.py", "sweep": APP / "tools" / "sweep_d4.py",
          "cfc": APP / "tools" / "chain_fill_check.py", "s8": APP / "tools" / "s8_shapes.py",
-         "conftest": APP / "tests" / "conftest.py", "guards": APP / "tests" / "test_g4_guards.py"}
+         "conftest": APP / "tests" / "conftest.py", "guards": APP / "tests" / "test_g4_guards.py",
+         "knee_g": APP / "radar" / "knee_g.py", "activity": APP / "radar" / "activity.py", "g_record": APP / "radar" / "g_record.py",
+         "events": APP / "radar" / "events.py", "derive_g": APP / "tools" / "derive_g.py", "report": APP / "tools" / "dryrun_lookup_report.py"}
 
 import os
-SKIP = set(filter(None, os.environ.get("BREAK_SKIP", "").split(",")))   # e.g. BREAK_SKIP=cfc while a sweep executes chain_fill_check.py
+SKIP = set(filter(None, os.environ.get("BREAK_SKIP", "").split(",")))
+REPEAT = max(1, int(os.environ.get("BREAK_REPEAT", "3")))   # QA evidence rule: N = 3 by default   # QA: run each mutant N times; mixed outcomes = FLIP = BAD (probabilistic)   # e.g. BREAK_SKIP=cfc while a sweep executes chain_fill_check.py
 MUTATIONS = [m for m in MUTATIONS if (m[4] if len(m) > 4 else "signals") not in SKIP]
 FILES = {k: v for k, v in FILES.items() if k not in SKIP}
 # ---- mirror mode (QA structural fix 2026-09-26): mutations are applied to COPIES in a scratch mirror of app/;
@@ -195,15 +317,16 @@ for m in MUTATIONS:
     name, old, new, test = m[:4]
     key = m[4] if len(m) > 4 else "signals"
     edits = [(key, old, new)] + list(m[5] if len(m) > 5 else [])
-    test = test if "::" in test else f"test_g4_signals.py::{test}"
+    test = test if ("::" in test or test.endswith(".py")) else f"test_g4_signals.py::{test}"   # a bare file = the whole file
     origs, applicable = {}, True
     for k, o, n in edits:
         rel = FILES[k].relative_to(APP)
         src = mirror / rel
         origs.setdefault(src, (APP / rel).read_bytes())
         text = src.read_bytes().decode()
-        if o not in text:
+        if text.count(o) != 1:   # 0 = anchor gone; >1 = ambiguous (would mutate the first match, maybe the wrong site) -> BAD
             applicable = False
+            print(f"anchor occurs {text.count(o)}x in {rel}")
             break
         src.write_bytes(text.replace(o, n, 1).encode())
     if not applicable:
@@ -216,11 +339,17 @@ for m in MUTATIONS:
         for pc in mirror.rglob("__pycache__"):
             shutil.rmtree(pc, ignore_errors=True)
         # own absolute basetemp inside this mirror (QA standing rule): never the shared scratch/developer/pytest-tmp
-        r = subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-o", "pythonpath=tests",
-                            f"--basetemp={(mirror / 'pytest-tmp').resolve()}", f"tests/{test}"], cwd=mirror, capture_output=True, text=True, env=env)
-        last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
-        red = r.returncode == 1 and " failed" in last   # only a real test FAILURE counts; "no tests ran"/errors are not red
-        print(f"{'RED ' if red else 'NOT-RED (BAD)'} {name} -> {test}: rc={r.returncode} {last or r.stderr[-200:]}")
+        reds, last, rc = [], "", None
+        for _rep in range(REPEAT):
+            r = subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-o", "pythonpath=tests",
+                                f"--basetemp={(mirror / 'pytest-tmp').resolve()}", f"tests/{test}"], cwd=mirror, capture_output=True, text=True, env=env)
+            last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-200:]
+            rc = r.returncode
+            reds.append(r.returncode == 1 and " failed" in last)   # only a real test FAILURE counts; "no tests ran"/errors are not red
+        red = all(reds)
+        tag = "RED " if red else ("FLIP (BAD, probabilistic)" if any(reds) else "NOT-RED (BAD)")
+        rep = f" [{sum(reds)}/{REPEAT} red]" if REPEAT > 1 else ""
+        print(f"{tag} {name} -> {test}: rc={rc} {last}{rep}")
         ok &= red
     finally:
         for src, orig in origs.items():

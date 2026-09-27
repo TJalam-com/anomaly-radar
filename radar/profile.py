@@ -84,30 +84,44 @@ def _pad(a):
     return "0x" + "0" * 24 + a[2:].lower()
 
 
-def get_logs(cl, address, direction, lo=None, hi=None, depth=0, acc=None):
-    """All collateral Transfer logs into (in) or out of (out) `address`; bisects the block range when the node
-    refuses a too-large result. Returns (logs, status)."""
-    acc = [] if acc is None else acc
-    lo = FETCH["funding_lower_bound_block"] if lo is None else lo
+TOO_BIG = ("more than", "too many", "limit", "range")
+
+
+def fetch_logs(cl, address, direction, to_block):
+    """All collateral Transfer logs into (in) / out of (out) `address` over [funding_lower_bound_block, to_block]
+    (to_block = an integer resolved before the fetch, never 'latest'). Bisects when the node refuses a large result.
+    Returns (logs, record); record.subranges lists every leaf range with its status, so completeness can be judged
+    from the record alone (contiguous, gap-free, all ok)."""
+    lo0 = int(FETCH["funding_lower_bound_block"])
     topics = [TRANSFER, None, _pad(address)] if direction == "in" else [TRANSFER, _pad(address)]
-    res, err = cl.rpc_call("eth_getLogs", [{"address": TOKENS, "fromBlock": hex(lo),
-                                            "toBlock": hex(hi) if hi is not None else "latest", "topics": topics}])
-    if err is None:
-        acc.extend(res)
-        return acc, ("capped" if len(acc) > FETCH["hop1_log_cap"] else "ok")
-    msg = str(err).lower()
-    if ("more than" in msg or "too many" in msg or "limit" in msg or "range" in msg) and depth < 12:
-        if hi is None:
-            head, e2 = cl.rpc_call("eth_blockNumber", [])
-            if e2 is not None:
-                return acc, "unavailable"
-            hi = int(head, 16)
-        mid = (lo + hi) // 2
-        acc, st = get_logs(cl, address, direction, lo, mid, depth + 1, acc)
-        if st != "ok":
-            return acc, st
-        return get_logs(cl, address, direction, mid + 1, hi, depth + 1, acc)
-    return acc, "unavailable"
+    logs, subs = [], []
+
+    def rec(lo, hi, depth):
+        res, err = cl.rpc_call("eth_getLogs", [{"address": TOKENS, "fromBlock": hex(lo), "toBlock": hex(hi), "topics": topics}])
+        if err is None:
+            logs.extend(res)
+            subs.append({"from": lo, "to": hi, "status": "ok", "n": len(res)})
+            return True
+        if any(t in str(err).lower() for t in TOO_BIG) and depth < 12 and hi > lo:
+            mid = (lo + hi) // 2
+            return rec(lo, mid, depth + 1) and rec(mid + 1, hi, depth + 1)
+        subs.append({"from": lo, "to": hi, "status": "unavailable", "error": str(err)[:200]})
+        return False
+
+    ok = rec(lo0, int(to_block), 0)
+    status = "ok" if ok else "unavailable"
+    return logs, {"address": address.lower(), "direction": direction, "status": status, "n_logs": len(logs),
+                  "from_block": lo0, "to_block": int(to_block), "subranges": subs, "fetched_at": utcnow(), "cache_hit": False}
+
+
+def gap_free(record) -> bool:
+    """r14 Δ20: every sub-range ok, sorted ranges contiguous from from_block to the resolved integer to_block."""
+    if not isinstance(record.get("to_block"), int) or record.get("status") != "ok":
+        return False
+    subs = sorted(record.get("subranges") or [], key=lambda x: x["from"])
+    if not subs or subs[0]["from"] > record["from_block"] or subs[-1]["to"] != record["to_block"]:
+        return False
+    return all(x["status"] == "ok" for x in subs) and all(b["from"] == a["to"] + 1 for a, b in zip(subs, subs[1:]))
 
 
 def classify_shape(tx, wallet):
@@ -148,43 +162,68 @@ def profile_wallet(cl, wallet, win_conds, stop, P):
             entry["next_trade"] = {"status": st3, "body": nxt}
         b["redeems"][c] = entry
     b["transfers"] = {}
+    b["fetches"] = []
+    head, err = cl.rpc_call("eth_blockNumber", [])
+    if err is not None:
+        raise ProfileError(f"cannot resolve head block: {err}")
+    to_block = int(head, 16)
+    blk, err = cl.rpc_call("eth_getBlockByNumber", [hex(to_block), False])
+    if err is not None:
+        raise ProfileError(f"cannot read head block timestamp: {err}")
+    b["to_block"], b["to_block_ts"] = to_block, int(blk["timestamp"], 16)
+    breadth = int(P.get("s6_hop_breadth", 0))       # params v3 removed it (s6_max_hops = 1: hops >= 2 are never followed)
     for direction in ("in", "out"):
-        frontier, hop, dir_out = [wallet], 1, []
+        frontier, hop, dir_out = [(wallet.lower(), None)], 1, []
         status = "ok"
         while frontier and hop <= int(P["s6_max_hops"]):
             nxt_frontier = []
-            for addr in frontier:
-                key = (addr.lower(), direction)
+            for addr, parent in frontier:
+                key = (addr, direction)
                 if hop >= 2 and key in cl.hop_cache:
-                    logs, st = cl.hop_cache[key]
+                    logs, rec0 = cl.hop_cache[key]
+                    record = {**rec0, "cache_hit": True, "cache_fetched_at": rec0["fetched_at"]}
                     cl.calls["hop_cache_hits"] += 1
                 else:
-                    logs, st = get_logs(cl, addr, direction)
+                    logs, record = fetch_logs(cl, addr, direction, to_block)
+                    record["to_block_ts"] = b["to_block_ts"]
+                    if hop == 1 and record["status"] == "ok" and len(logs) > FETCH["hop1_log_cap"]:
+                        record["status"] = "capped"
+                    if hop >= 2 and len(logs) > FETCH["hop_n_hub_cap"]:
+                        record["status"] = "hub"            # design exclusion (r15 Δ24/Δ25): never expanded
+                        logs = []
                     if hop >= 2:
-                        cl.hop_cache[key] = (logs if len(logs) <= FETCH["hop_n_hub_cap"] else [], st if len(logs) <= FETCH["hop_n_hub_cap"] else "hub")
-                        if len(logs) > FETCH["hop_n_hub_cap"]:
-                            logs, st = [], "hub"
+                        cl.hop_cache[key] = (logs, record)
+                st = record["status"]
+                b["fetches"].append({"hop": hop, "parent": parent, "record": record})
                 if hop == 1 and st != "ok":
                     status = st
-                if hop >= 2 and (st != "ok" or len(logs) > FETCH["hop_n_hub_cap"]):  # 'hub' from cache lands here too
-                    dir_out.append({"hop": hop, "from_address": addr, "hub_or_error": st, "n": len(logs)})
+                if hop >= 2 and st != "ok":
+                    dir_out.append({"hop": hop, "from_address": addr, "hub_or_error": st, "n": record["n_logs"]})
                     continue
                 agg = {}
                 for lg in logs:
                     cp = "0x" + lg["topics"][1 if direction == "in" else 2][-40:]
-                    a = agg.setdefault(cp, {"n": 0, "amount": 0.0, "first_ts": None, "first_block": None, "tx": lg["transactionHash"],
-                                            "log_index": int(lg["logIndex"], 16), "token": lg["address"].lower()})
+                    blk_n = int(lg["blockNumber"], 16) if lg.get("blockNumber") else None
+                    li = int(lg["logIndex"], 16)
+                    a = agg.setdefault(cp, {"n": 0, "amount": 0.0, "amount_raw": 0, "first_ts": None, "first_block": None,
+                                            "tx": lg["transactionHash"], "log_index": li, "token": lg["address"].lower()})
                     ts = int(lg["blockTimestamp"], 16) if lg.get("blockTimestamp") else None
+                    raw = int(lg["data"], 16)
                     a["n"] += 1
-                    a["amount"] += int(lg["data"], 16) / 1e6
-                    blk = int(lg["blockNumber"], 16) if lg.get("blockNumber") else None
-                    if ts is not None and (a["first_ts"] is None or ts < a["first_ts"]):
-                        a["first_ts"], a["first_block"], a["tx"], a["log_index"], a["token"] = ts, blk, lg["transactionHash"], int(lg["logIndex"], 16), lg["address"].lower()
-                for cp, a in agg.items():
-                    dir_out.append({"hop": hop, "via": addr, "counterparty": cp, **a})
-                follow = sorted((cp for cp in agg if cp not in stop and cp != wallet.lower()),
-                                key=lambda cp: -agg[cp]["amount"])[:int(P["s6_hop_breadth"])]
-                nxt_frontier += follow
+                    a["amount_raw"] += raw                    # exact integer sum (6-decimal tokens; C4 checked at start)
+                    a["amount"] = a["amount_raw"] / 1e6
+                    first_key = (blk_n if blk_n is not None else 1 << 62, li)
+                    if a["first_block"] is None or first_key < (a["first_block"], a["log_index"]):
+                        a["first_ts"], a["first_block"], a["tx"], a["log_index"], a["token"] = ts, blk_n, lg["transactionHash"], li, lg["address"].lower()
+                # r15 Δ30 follow rule: (-amount_raw, first_block, first_log_index, address), independent of RPC order
+                cands = sorted((cp for cp in agg if cp not in stop and cp != wallet.lower()),
+                               key=lambda cp: (-agg[cp]["amount_raw"], agg[cp]["first_block"] or 0, agg[cp]["log_index"], cp))
+                follow = cands[:breadth]
+                for cp in sorted(agg):
+                    a = agg[cp]
+                    dir_out.append({"hop": hop, "via": addr, "counterparty": cp, **a, "amount_raw": str(a["amount_raw"]),
+                                    "selected": cp in follow, "stop_listed": cp in stop})
+                nxt_frontier += [(cp, addr) for cp in follow]
             frontier, hop = nxt_frontier, hop + 1
         b["transfers"][direction] = {"status": status, "edges": dir_out}
     b["t_snap"] = utcnow()
@@ -223,20 +262,47 @@ def bundle_to_rows(b, infra):
             nb = e.get("next_trade", {})
             nrows = nb.get("body", {}).get("data", []) if nb.get("status") == 200 else None
             after.append((w, c, nrows[0]["timestamp"] if nrows else None))
-    transfers = [(w, d, e["hop"], e["counterparty"], e["token"], e["amount"], e["n"], e["first_ts"], e["tx"], e["log_index"])
+    transfers = [(w, d, e["hop"], e["counterparty"], e["token"], e["amount"], e["n"], e["first_ts"], e["tx"], e["log_index"],
+                  e.get("via"), e.get("selected"), e.get("stop_listed"), e.get("amount_raw"), e.get("first_block"))
                  for d in ("in", "out") for e in b["transfers"][d]["edges"] if e.get("counterparty")]
     return prof, redeems, after, transfers
 
 
+def bundle_expansions(b):
+    """One row per fetch the writer made or reused for this wallet (r14 Δ20, r15 Δ24/Δ25): completeness inputs."""
+    kids = {(d, e["hop"], e["via"]) for d in ("in", "out") for e in b["transfers"][d]["edges"] if e.get("counterparty")}
+    rows = []
+    for f in b.get("fetches", []):
+        r = f["record"]
+        rows.append((b["wallet"], r["direction"], f["hop"], f.get("parent"), r["address"], r["status"], r["n_logs"],
+                     r.get("to_block"), r.get("to_block_ts"), gap_free(r), bool(r.get("cache_hit")), r.get("cache_fetched_at"),
+                     f.get("fetch_file"), (r["direction"], f["hop"], r["address"]) in kids))
+    return rows
+
+
 def finalize(prof_dir: Path, meta: dict) -> dict:
     infra = set(entities.POLYMARKET_INFRA)
-    P_, R_, A_, T_ = [], [], [], []
+    P_, R_, A_, T_, E_ = [], [], [], [], []
     files = []
     for f in sorted((prof_dir / "raw").glob("*.json")):
         raw = f.read_bytes()
-        files.append({"path": f.relative_to(prof_dir).as_posix(), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
-        p, r, a, t = bundle_to_rows(json.loads(raw), infra)
-        P_.append(p); R_ += r; A_ += a; T_ += t
+        b = json.loads(raw)
+        files.append({"path": f.relative_to(prof_dir).as_posix(), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                      "kind": "bundle", "writer_id": b.get("writer_id")})
+        p, r, a, t = bundle_to_rows(b, infra)
+        P_.append(p); R_ += r; A_ += a; T_ += t; E_ += bundle_expansions(b)
+    for f in sorted((prof_dir / "fetch").glob("*.json")) if (prof_dir / "fetch").exists() else []:
+        raw = f.read_bytes()
+        files.append({"path": f.relative_to(prof_dir).as_posix(), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                      "kind": "fetch", "writer_id": json.loads(raw).get("writer_id")})
+    L_, Y_ = [], []
+    for f in sorted((prof_dir / "lookups").glob("*.json")) if (prof_dir / "lookups").exists() else []:
+        raw = f.read_bytes()
+        r = json.loads(raw)
+        files.append({"path": f.relative_to(prof_dir).as_posix(), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                      "kind": "lookup", "writer_id": r.get("writer_id")})
+        L_.append(r)
+        Y_ += [(r["address"], y, fb, (r.get("first_ts") or {}).get(y)) for y, fb in sorted(r["first_blocks"].items())]
     d = prof_dir / "derived"
     d.mkdir(exist_ok=True)
     ts = lambda u: None if u is None else int(u)
@@ -259,7 +325,29 @@ def finalize(prof_dir: Path, meta: dict) -> dict:
                                "token": [x[4] for x in T_], "amount": pa.array([x[5] for x in T_], pa.float64()),
                                "n_logs": pa.array([x[6] for x in T_], pa.int64()),
                                "first_ts_unix": pa.array([x[7] for x in T_], pa.int64()),
-                               "tx_hash": [x[8] for x in T_], "log_index": pa.array([x[9] for x in T_], pa.int64())}),
+                               "tx_hash": [x[8] for x in T_], "log_index": pa.array([x[9] for x in T_], pa.int64()),
+                               "via": [x[10] if len(x) > 10 else None for x in T_],
+                               "selected": pa.array([x[11] if len(x) > 11 else None for x in T_], pa.bool_()),
+                               "stop_listed": pa.array([x[12] if len(x) > 12 else None for x in T_], pa.bool_()),
+                               "amount_raw": [x[13] if len(x) > 13 else None for x in T_],
+                               "first_block": pa.array([x[14] if len(x) > 14 else None for x in T_], pa.int64())}),
+        "expansions": pa.table({"proxy_wallet": [x[0] for x in E_], "direction": [x[1] for x in E_],
+                                "hop": pa.array([x[2] for x in E_], pa.int32()), "parent": [x[3] for x in E_],
+                                "address": [x[4] for x in E_], "status": [x[5] for x in E_],
+                                "n_logs": pa.array([x[6] for x in E_], pa.int64()), "to_block": pa.array([x[7] for x in E_], pa.int64()),
+                                "to_block_ts": pa.array([x[8] for x in E_], pa.int64()), "gap_free": pa.array([x[9] for x in E_], pa.bool_()),
+                                "cache_hit": pa.array([x[10] for x in E_], pa.bool_()), "cache_fetched_at": [x[11] for x in E_],
+                                "fetch_file": [x[12] for x in E_], "has_child_edges": pa.array([x[13] for x in E_], pa.bool_())}),
+        "lookups": pa.table({"address": [r["address"] for r in L_], "status": [r["status"] for r in L_],
+                             "capped": pa.array([bool(r["capped"]) for r in L_], pa.bool_()),
+                             "cap_block": pa.array([r["cap_block"] for r in L_], pa.int64()), "cap_ts": pa.array([r.get("cap_ts") for r in L_], pa.int64()),
+                             "from_block": pa.array([r["from_block"] for r in L_], pa.int64()), "to_block": pa.array([r["to_block"] for r in L_], pa.int64()),
+                             "n_distinct": pa.array([r["n_distinct"] for r in L_], pa.int64()), "cap": pa.array([r["cap"] for r in L_], pa.int64()),
+                             "subranges_json": [json.dumps(r["subranges"], sort_keys=True) for r in L_],
+                             "n_sharers_fetch": pa.array([r.get("n_sharers") for r in L_], pa.int64()),
+                             "n_natural_sharers_fetch": pa.array([r.get("n_natural_sharers") for r in L_], pa.int64())}),
+        "lookup_y": pa.table({"address": [x[0] for x in Y_], "y": [x[1] for x in Y_], "first_block": pa.array([x[2] for x in Y_], pa.int64()),
+                              "first_ts": pa.array([x[3] for x in Y_], pa.int64())}),
     }
     derived = []
     for name, tbl in tables.items():
@@ -271,6 +359,12 @@ def finalize(prof_dir: Path, meta: dict) -> dict:
     (prof_dir / "manifest.json").write_bytes(body)
     return {"manifest": str(prof_dir / "manifest.json"), "manifest_sha256": hashlib.sha256(body).hexdigest(),
             "wallets": len(P_), "derived": derived}
+
+
+def check_v3_fetch_params(P: dict):
+    """Planner V1-6: under params v3 (S6 C1) the writer fetches hop-1 transfers + activity lookups only; hop >= 2 is never expanded."""
+    if P.get("s6_rule") == "C1" and int(P["s6_max_hops"]) != 1:
+        raise ProfileError("params v3 (S6 C1) fetches hop 1 only: s6_max_hops must be 1")
 
 
 def targets(snap_dir: Path, P: dict, bypass: list[str]):
@@ -290,15 +384,15 @@ def targets(snap_dir: Path, P: dict, bypass: list[str]):
     signals.universe(con, P)
     # exact net position (QA determinism ruling 2026-09-27): same helper as signals.s5/s8, so an exact-zero
     # position is never a winning bet here either
-    rows = con.execute(f"""WITH prof AS (SELECT proxy_wallet FROM universe_t WHERE scope = 'all' AND profiled),
+    rows = con.execute(f"""WITH prof AS (SELECT proxy_wallet, passed_prefilter FROM universe_t WHERE scope = 'all' AND profiled),
         wb AS (SELECT f.proxy_wallet, f.condition_id, f.token_id,
                       sum(CASE WHEN f.side = 'BUY' THEN {signals.sz()} ELSE -{signals.sz()} END) AS pos
                FROM signal_fills f JOIN prof USING (proxy_wallet) WHERE f.walk = 'all' GROUP BY 1, 2, 3)
-        SELECT prof.proxy_wallet, list(DISTINCT wb.condition_id) FILTER (WHERE wb.condition_id IS NOT NULL)
+        SELECT prof.proxy_wallet, list(DISTINCT wb.condition_id) FILTER (WHERE wb.condition_id IS NOT NULL), bool_or(prof.passed_prefilter)
         FROM prof LEFT JOIN (wb JOIN tokens_v k USING (token_id) JOIN markets_r m ON m.condition_id = wb.condition_id)
              ON wb.proxy_wallet = prof.proxy_wallet AND wb.pos > 0 AND NOT m.void AND k.outcome_index = m.chain_winner_index
         GROUP BY 1 ORDER BY 1""").fetchall()
-    return [(w, c or []) for w, c in rows]
+    return [(w, c or [], bool(n)) for w, c, n in rows]      # n = natural (passed_prefilter); bypass-only wallets are False
 
 
 def main(argv=None):
@@ -309,7 +403,17 @@ def main(argv=None):
     ap.add_argument("--bypass-list", help="opaque wallet list (header column matching wallet|address)")
     ap.add_argument("--limit", type=int, help="profile only the first N targets (budget probes)")
     ap.add_argument("--workers", type=int, default=1, help="parallel wallets (QA: at most 3); shared hop cache, stop on first 429")
+    ap.add_argument("--prof-id", required=True, help="profile id as pinned in WRITER_PINS.md, e.g. PROF-002")
+    ap.add_argument("--pins", default=str(config.APP_DIR.parent / "ledger" / "WRITER_PINS.md"), help="QA-held pin ledger")
+    ap.add_argument("--print-writer-id", action="store_true", help="print this build's writer_id + closure and exit (no fetch)")
     a = ap.parse_args(argv)
+    from radar import scoring_view, signals, writer_id as wid_mod   # noqa: F401  eager: the closure must see every module
+    closure_items = wid_mod.closure(config.APP_DIR, Path(a.params))
+    WID = wid_mod.writer_id(closure_items)
+    if a.print_writer_id:
+        print(json.dumps({"writer_id": WID, "closure": closure_items}, indent=1))
+        return 0
+    pins_sha = wid_mod.require_pinned(Path(a.pins), a.prof_id, WID)
     import tomllib, csv, io
     praw = Path(a.params).read_bytes()
     pcfg = tomllib.loads(praw.decode("utf-8"))
@@ -324,6 +428,7 @@ def main(argv=None):
             raise ProfileError("bypass list has no wallet/address column")
         bypass = sorted({r[col].strip().lower() for r in rd if r[col].strip()})
         bmeta = {"path": a.bypass_list, "sha256": hashlib.sha256(raw).hexdigest(), "rows": len(bypass)}
+    check_v3_fetch_params(P)
     prof = Path(a.prof)
     (prof / "raw").mkdir(parents=True, exist_ok=True)
     tg = targets(Path(a.snap), P, bypass)
@@ -331,6 +436,12 @@ def main(argv=None):
         tg = tg[:a.limit]
     stop = {r[0] for r in entities.rows()}
     cl = Clients()
+    decimals = {}
+    for t in TOKENS:                                          # C4: amounts are divided by 1e6; refuse any other scale
+        res, err = cl.rpc_call("eth_call", [{"to": t, "data": "0x313ce567"}, "latest"])
+        if err is not None or not res or int(res, 16) != 6:
+            raise ProfileError(f"token {t} decimals() = {res!r} (err {err}); the writer assumes 6")
+        decimals[t] = int(res, 16)
     blk, err = cl.rpc_call("eth_getBlockByNumber", [hex(FETCH["funding_lower_bound_block"]), False])
     if err is not None:
         raise ProfileError(f"cannot read lower-bound block: {err}")
@@ -344,7 +455,7 @@ def main(argv=None):
     lock = threading.Lock()
     done = [0]
     worker_clients = []
-    todo = [(i, w, wins) for i, (w, wins) in enumerate(tg) if not (prof / "raw" / f"{w}.json").exists()]
+    todo = [(i, w, wins) for i, (w, wins, _nat) in enumerate(tg) if not (prof / "raw" / f"{w}.json").exists()]
 
     def work(item):
         i, w, wins = item
@@ -360,6 +471,18 @@ def main(argv=None):
         except ProfileError:
             stop_flag.set()
             raise
+        wid_mod.assert_unchanged(closure_items, config.APP_DIR, Path(a.params))
+        b["writer_id"] = WID
+        (prof / "fetch").mkdir(exist_ok=True)
+        for f in b["fetches"]:
+            r = f["record"]
+            name = f"fetch/{r['address']}_{r['direction']}_{r['to_block']}.json"
+            f["fetch_file"] = name
+            target = prof / name
+            if not r.get("cache_hit") and not target.exists():
+                part = target.with_suffix(".json.part")
+                part.write_bytes(json.dumps({**r, "writer_id": WID}, sort_keys=True).encode())
+                part.replace(target)
         tmp = prof / "raw" / f"{w}.json.part"
         tmp.write_bytes(json.dumps(b, sort_keys=True).encode())
         tmp.replace(prof / "raw" / f"{w}.json")      # atomic: a partial bundle never looks complete
@@ -371,11 +494,37 @@ def main(argv=None):
     with ThreadPoolExecutor(max(1, a.workers)) as ex:
         for fut in [ex.submit(work, it) for it in todo]:
             fut.result()
+    lk_meta, snap_block, t_snap = None, None, None
+    if P.get("s6_rule") == "C1":      # params v3: activity lookups for the S6 lookup set (D1 r16b §2), after all hop-1 fetches
+        from datetime import datetime as _dt
+        from radar import activity
+        fin = json.loads((Path(a.snap) / "manifest.json").read_bytes())["finished_at"]
+        t_snap = int(_dt.fromisoformat(fin.replace("Z", "+00:00")).timestamp())
+        h, err = cl.rpc_call("eth_blockNumber", [])
+        if err is not None:
+            raise ProfileError(f"cannot resolve head block for the lookups: {err}")
+        head = int(h, 16)
+        snap_block = activity.block_before(cl, t_snap, head)          # block(SNAP) = last block with ts < SNAP instant (strict)
+        natural = {w for w, _wins, nat in tg if nat}
+        edges = []
+        for f in sorted((prof / "raw").glob("*.json")):
+            bb = json.loads(f.read_bytes())
+            edges += [(bb["wallet"], e["counterparty"]) for d in ("in", "out") for e in bb["transfers"][d]["edges"]
+                      if e.get("hop") == 1 and e.get("counterparty")]
+        lset = activity.lookup_set(edges, natural, {x.lower() for x in stop})
+        wid_mod.assert_unchanged(closure_items, config.APP_DIR, Path(a.params))
+        lk_meta = activity.run_lookups(cl, prof, lset, head, int(P["s6_activity_cap"]), WID, stop_flag)
+        lk_meta.update(lookup_head_block=head, activity_cap=int(P["s6_activity_cap"]))
     meta = {"snap": str(a.snap), "snap_manifest_sha256": hashlib.sha256((Path(a.snap) / "manifest.json").read_bytes()).hexdigest(),
             "step4_manifest_sha256": hashlib.sha256((Path(a.snap) / "step4" / "manifest.json").read_bytes()).hexdigest(),
             "params_file": {"path": a.params, "sha256": hashlib.sha256(praw).hexdigest()}, "fetch": FETCH,
             "lower_bound_block_ts": lb_ts, "bypass_list": bmeta, "targets": len(tg), "workers": a.workers,
-            "calls_this_session": {k: cl.calls[k] + sum(c.calls[k] for c in worker_clients) for k in cl.calls}}
+            "prof_id": a.prof_id, "writer_id": WID, "writer_closure": closure_items, "writer_pins_sha256": pins_sha,
+            "follow_rule": "top s6_hop_breadth by (-amount_raw exact, first_block, first_log_index, address); stop set and wallet excluded",
+            "token_decimals": decimals, "bundle_path": "raw/<wallet>.json", "stop_set_sha256": hashlib.sha256(
+                json.dumps(sorted(stop)).encode()).hexdigest(),
+            "calls_this_session": {k: cl.calls[k] + sum(c.calls[k] for c in worker_clients) for k in cl.calls},
+            "snap_block": snap_block, "snap_instant_unix": t_snap, "lookups": lk_meta}
     print(json.dumps(finalize(prof, meta), indent=1))
 
 

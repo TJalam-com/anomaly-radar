@@ -48,7 +48,7 @@ def big_snap(root: Path) -> Path:
                    1::BIGINT AS resolution_block, {RES}::BIGINT AS resolution_ts_unix, '0x0' AS oracle, '[1, 0]' AS payouts_json,
                    FALSE AS void, 0::BIGINT AS chain_winner_index, {RES - 1}::BIGINT AS t_ref_unix, 0::BIGINT AS closed_at_delta_s
                    FROM range({N_COND}) t(i)) TO '{S4}/resolutions_chain.parquet' (FORMAT PARQUET)""")
-    (snap / "manifest.json").write_bytes(b"{}")
+    (snap / "manifest.json").write_bytes(b'{"finished_at": "2026-06-01T00:00:00Z"}')   # QA N1
     (snap / "step4" / "manifest.json").write_bytes(b"{}")
     return snap
 

@@ -283,3 +283,96 @@ def test_sparse_canonicalises_signed_zero_in_raw_and_component():
     sg._sparse(con, "S5", [("all", W(1), -0.0, -0.0, None, {})])
     raw, comp = con.execute("SELECT raw_value, component FROM sig_sparse").fetchone()
     assert math.copysign(1.0, raw) == 1.0 and math.copysign(1.0, comp) == 1.0
+
+
+
+# ---------------------------------------------------------------- r15 path completeness (r13 Δ14, r14 Δ20–Δ22, r15 Δ24/Δ25, C5)
+T_PRE = RES - 5 * H          # before the fixture as-of instant (_t_asof_unix = RES + 1e7)
+
+
+def _prof_world(w, exps, transfers):
+    world = World().market(C)
+    big_lowodds(w, world)                                    # passes the prefilter -> profiled
+    world.profile[w] = dict(ftt=RES - 86400, fft=RES - 90000, vol=1e5, tsnap=RES + 90 * 86400)
+    world.expansions = exps
+    world.transfers += transfers
+    return world
+
+
+def _hop1(w, d="in", **kw):
+    return dict(proxy_wallet=w, direction=d, hop=1, address=w, **kw)
+
+
+def test_s6_negative_needs_complete_path():
+    w = W(60)
+    ok = run(_prof_world(w, [_hop1(w), _hop1(w, "out")], []))
+    assert sig(ok, w, "S6")[2] == "no_transfers_found"                         # complete, empty -> a real negative
+    bad = run(_prof_world(w, [_hop1(w, gap_free=False), _hop1(w, "out")], []))
+    assert sig(bad, w, "S6")[2] == "transfers_unverified"                     # gap in the record -> NA, never 0
+    stale = run(_prof_world(w, [_hop1(w, to_block_ts=RES), _hop1(w, "out")], []))
+    assert sig(stale, w, "S6")[2] == "transfers_unverified"                   # (cached) record ends before t
+
+
+def test_hub_capped_counterparty_is_no_na_and_counted():
+    w, A, Hub, X = W(61), W(71), W(72), W(73)
+    exps = [_hop1(w), _hop1(w, "out"), dict(proxy_wallet=w, direction="in", hop=2, address=A),
+            dict(proxy_wallet=w, direction="in", hop=2, address=Hub, status="hub", n_logs=9999, gap_free=False)]
+    tr = [(w, "in", 1, A, w, True, False, T_PRE), (w, "in", 1, Hub, w, True, False, T_PRE)]
+    con = run(_prof_world(w, exps, tr))
+    raw, comp, na = sig(con, w, "S6")
+    assert na is None and raw == 0.0                                          # hub excluded from C(X) and from F-4 (Δ24/Δ25)
+    ev = con.execute("SELECT evidence_json FROM signals_dense WHERE scope='all' AND proxy_wallet=? AND signal_id='S6'", [w]).fetchone()[0]
+    assert '"hub_capped": 1' in ev
+    # control: the hub replaced by an ordinary unfollowed pre-t counterparty -> the omission is flagged
+    tr2 = [(w, "in", 1, A, w, True, False, T_PRE), (w, "in", 1, X, w, False, False, T_PRE)]
+    con2 = run(_prof_world(w, exps[:3], tr2))
+    assert sig(con2, w, "S6")[2] == "breadth_truncated"
+
+
+def test_precedence_unverified_over_breadth_truncated():
+    w, A, X = W(62), W(74), W(75)
+    exps = [_hop1(w), _hop1(w, "out", status="unavailable", gap_free=False), dict(proxy_wallet=w, direction="in", hop=2, address=A)]
+    tr = [(w, "in", 1, A, w, True, False, T_PRE), (w, "in", 1, X, w, False, False, T_PRE)]
+    con = run(_prof_world(w, exps, tr))
+    assert sig(con, w, "S6")[2] == "transfers_unverified"                     # C5: both apply -> transfers_unverified wins
+
+
+def test_selected_counterparty_without_fetch_record_is_incomplete():
+    w, A = W(63), W(76)
+    con = run(_prof_world(w, [_hop1(w), _hop1(w, "out")], [(w, "in", 1, A, w, True, False, T_PRE)]))
+    assert sig(con, w, "S6")[2] == "transfers_unverified"
+
+
+def test_s6_positive_on_incomplete_path_keeps_value_and_marker():
+    w, o, shared = W(64), W(65), W(77)
+    world = _prof_world(w, None, [])
+    big_lowodds(o, world)
+    world.profile[o] = dict(ftt=RES - 86400, vol=1e5)
+    world.expansions = [_hop1(w, gap_free=False), _hop1(w, "out"), _hop1(o), _hop1(o, "out")]
+    world.transfers += [(w, "in", 1, shared), (o, "in", 1, shared)]
+    con = run(world)
+    raw, comp, na = sig(con, w, "S6")
+    assert na is None and raw == 1.0                                          # found link = fact
+    ev = con.execute("SELECT evidence_json FROM signals_dense WHERE scope='all' AND proxy_wallet=? AND signal_id='S6'", [w]).fetchone()[0]
+    assert '"incomplete_path": true' in ev                                    # U14 marker source
+
+
+def test_path_flags_respect_edge_direction():
+    w, B = W(64), W(77)
+    world = _prof_world(w, [_hop1(w), _hop1(w, "out")], [(w, "out", 1, B, w, True, False, T_PRE)])
+    assert sig(run(world), w, "S6")[2] == "transfers_unverified"                # in+out: selected 'out' cp has no fetch record
+    assert sig(run(world, s6_edges=("in",)), w, "S6")[:3] == (0.0, 0.0, None)      # in-only: the 'out' path is not traced, so it
+    #                                                  cannot make S6 NA; v2 no_transfers_found counts rows in any direction -> value 0
+
+
+def test_s1_uses_funding_only_from_complete_hop1_in():
+    w = W(66)
+    world = _prof_world(w, [_hop1(w), _hop1(w, "out")], [])
+    world.fill(C, w, "BUY", 20_000, 0.10, RES - 10 * H)                       # qualifying bet
+    hours_ok = sig(run(world), w, "S1")[0]
+    assert hours_ok is not None                                               # complete -> computed from min(ftt, fft)
+    world.expansions = [_hop1(w, gap_free=False), _hop1(w, "out")]
+    assert sig(run(world), w, "S1")[2] == "transfers_unverified"               # incomplete, bound 0 -> NA (fallback inactive)
+    world.profile[w]["lb_ts"] = RES                                           # synthetic raised bound: ftt < bound
+    r = sig(run(world), w, "S1")
+    assert r[2] is None and r[0] == pytest.approx((RES - 10 * H - (RES - 86400)) / 3600)   # t0 = ftt (fallback)

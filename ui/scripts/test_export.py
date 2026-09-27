@@ -51,9 +51,30 @@ def test_every_export_query_passes_the_guard():
         exp.guard(m.group(1))
 
 
-def test_exported_json_has_no_forbidden_keys():
+FRESH_CLONE = "no exported run data in this checkout; run export_ui_data.py first"
+
+
+def real_files_or_skip():
+    """QA (public repo): a fresh clone has NO data root (ui/data is not published) -> skip. A data root that exists but holds no
+    real-run JSON -> fail (the vacuity guard stays intact locally)."""
+    if not DATA_ROOTS:
+        pytest.skip(FRESH_CLONE)
     files = real_run_files()
-    assert files, "no exported real-run data to check (vacuity guard)"
+    assert files, "a data root exists but holds no exported real-run data (vacuity guard)"
+    return files
+
+
+def test_data_guard_skips_on_a_fresh_clone_and_fails_on_an_empty_root(tmp_path, monkeypatch):
+    monkeypatch.setitem(globals(), "DATA_ROOTS", [])
+    with pytest.raises(pytest.skip.Exception, match="no exported run data"):
+        real_files_or_skip()
+    monkeypatch.setitem(globals(), "DATA_ROOTS", [tmp_path])                  # a data root with no real run in it
+    with pytest.raises(AssertionError, match="vacuity guard"):
+        real_files_or_skip()
+
+
+def test_exported_json_has_no_forbidden_keys():
+    files = real_files_or_skip()
     for f in files:
         raw = f.read_bytes().lower()
         assert b"total_scorer" not in raw and b"bypass" not in raw, f
@@ -79,13 +100,15 @@ def test_dumps_maps_nonfinite_to_null_and_is_strict_json():
 
 
 def test_exported_real_runs_are_strict_json():
-    files = [f for f in real_run_files() if f.name in ("leaderboard_all.json", "context.json", "markets.json")]
+    files = [f for f in real_files_or_skip() if f.name in ("leaderboard_all.json", "context.json", "markets.json")]
     for f in files:
         _strict(f.read_bytes())
 
 
 def test_fixture_runs_are_marked_and_separate():
     """a fixture run is never mixed into real data: context.fixture is true and its run id is not a real run id."""
+    if not DATA_ROOTS:
+        pytest.skip(FRESH_CLONE)
     for root in DATA_ROOTS:
         for ctx in root.glob("*/context.json"):
             c = json.loads(ctx.read_bytes())

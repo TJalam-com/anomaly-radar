@@ -8,7 +8,8 @@ RES = 1_772_000_000  # resolution ts of every fixture market (unix)
 P_DEFAULT = dict(p_low=0.20, pre_min_stake=1000, s1_min_stake=1000, s1_fresh_h=48, s1_stale_h=720,
                  s3_min_stake=1000, s3_cap_usdc=100000, s4_lead_h=24, s4_min_stake=1000, s4_cap_usdc=50000,
                  s5_full_at=6.0, s5_min_bets=3, s6_max_hops=3, s6_full_at=5, s6_fanout_max=20,
-                 s7_min_stake=1000, s7_window_s=600, s7_full_at=5, s8_quick_h=24, s8_dormant_d=30)
+                 s7_min_stake=1000, s7_window_s=600, s7_full_at=5, s8_quick_h=24, s8_dormant_d=30,
+                 s6_hop_breadth=3, _t_asof_unix=RES + 10_000_000)
 
 
 def T(u):
@@ -27,7 +28,9 @@ class World:
         self.profile = {}   # wallet -> dict
         self.redeems = []   # (wallet, cond, ts, shape)
         self.trade_after = []  # (wallet, cond, next_trade_ts)
-        self.transfers = []  # (wallet, direction, hop, counterparty)
+        self.transfers = []  # (wallet, direction, hop, counterparty[, via, selected, stop_listed, first_ts, first_block])
+        self.lookups = {}    # S6 v3: X -> dict(status, capped, cap_block, from_block, to_block, subranges, first_blocks)
+        self.expansions = None  # None -> complete hop-1 rows for every profiled wallet; else list of dict rows
         self.stop = []
         self.bypass = []
         self.scopes = {}    # scope -> [conds]
@@ -85,9 +88,31 @@ class World:
         con.execute("CREATE TABLE trade_after(proxy_wallet TEXT, condition_id TEXT, next_trade_ts TIMESTAMPTZ)")
         for w, c, t in self.trade_after:
             con.execute("INSERT INTO trade_after VALUES (?,?,?)", [w, c, T(t) if t is not None else None])
-        con.execute("CREATE TABLE transfers(proxy_wallet TEXT, direction TEXT, hop INT, counterparty TEXT)")
+        con.execute("""CREATE TABLE transfers(proxy_wallet TEXT, direction TEXT, hop INT, counterparty TEXT, via TEXT,
+            selected BOOLEAN, stop_listed BOOLEAN, first_ts TIMESTAMPTZ, first_block BIGINT)""")
         for x in self.transfers:
-            con.execute("INSERT INTO transfers VALUES (?,?,?,?)", list(x))
+            x = list(x) + [None] * (9 - len(x))
+            via = x[4] if x[4] is not None else (x[0] if x[2] == 1 else None)
+            con.execute("INSERT INTO transfers VALUES (?,?,?,?,?,?,?,?,?)",
+                        [x[0], x[1], x[2], x[3], via, bool(x[5]), bool(x[6]), T(x[7]) if x[7] is not None else None, x[8]])
+        con.execute("""CREATE TABLE lookups(address TEXT, status TEXT, capped BOOLEAN, cap_block BIGINT, from_block BIGINT,
+            to_block BIGINT, subranges_json TEXT)""")
+        con.execute("CREATE TABLE lookup_y(address TEXT, y TEXT, first_block BIGINT)")
+        import json as _json
+        for a, r in self.lookups.items():
+            con.execute("INSERT INTO lookups VALUES (?,?,?,?,?,?,?)", [a, r.get("status", "ok"), r.get("capped", False), r.get("cap_block"),
+                        r.get("from_block", 0), r.get("to_block", 10_000), _json.dumps(r.get("subranges", [{"from": 0, "to": r.get("to_block", 10_000), "status": "ok"}]))])
+            for i, fb in enumerate(r.get("first_blocks", [])):
+                con.execute("INSERT INTO lookup_y VALUES (?,?,?)", [a, f"y{i}", fb])
+        con.execute("""CREATE TABLE expansions(proxy_wallet TEXT, direction TEXT, hop INT, parent TEXT, address TEXT, status TEXT,
+            n_logs BIGINT, to_block_ts BIGINT, gap_free BOOLEAN, has_child_edges BOOLEAN)""")
+        exps = self.expansions if self.expansions is not None else [
+            dict(proxy_wallet=w, direction=d, hop=1, address=w) for w in list(self.profile) + list(self.bypass) for d in ("in", "out")]
+        for e in exps:
+            con.execute("INSERT INTO expansions VALUES (?,?,?,?,?,?,?,?,?,?)", [
+                e["proxy_wallet"], e["direction"], e.get("hop", 1), e.get("parent"), e.get("address", e["proxy_wallet"]),
+                e.get("status", "ok"), e.get("n_logs", 1), e.get("to_block_ts", RES + 20_000_000), e.get("gap_free", True),
+                e.get("has_child_edges", True)])
         con.execute("CREATE TABLE stop_list(address TEXT)")
         for a in self.stop:
             con.execute("INSERT INTO stop_list VALUES (?)", [a])

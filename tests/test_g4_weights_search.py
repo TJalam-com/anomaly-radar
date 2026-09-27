@@ -101,6 +101,23 @@ def test_selection_gate_passes_and_base_run_is_gated(tmp_path):
     assert b"base_run_id" not in Path(r["log"]).read_bytes()          # no run id / clock inside gated bytes
 
 
+def test_bootstrap_rng_is_constructed_with_the_given_seed(tmp_path, monkeypatch):
+    """Deterministic detector for the selection gate's seeding. The end-to-end byte gate above detects an unseeded resample only
+    probabilistically on small fixtures (measured: 19/20), and a probabilistic detector is not a check (QA)."""
+    snap, pf, look, sha = setup(tmp_path)
+    r = go(tmp_path, snap, pf, look, sha)
+    seeds = []
+    real = ws.random.Random
+
+    class Recorder(real):
+        def __init__(self, *a, **k):
+            seeds.append(a[0] if a else k.get("x", "UNSEEDED"))
+            super().__init__(*a, **k)
+    monkeypatch.setattr(ws.random, "Random", Recorder)
+    ws.select(Path(r["selection_gate"]["base_run"]), look, sha, ("wallet", "label", "unit"), ("pos", "neg"), 50, 12345, tmp_path / "sel")
+    assert seeds == [12345]
+
+
 def test_selection_gate_fails_and_voids_on_difference(tmp_path, monkeypatch):
     """The byte comparison can fail: selection B writes one extra byte -> SearchError, A renamed A+VOID."""
     snap, pf, look, sha = setup(tmp_path)

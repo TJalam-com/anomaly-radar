@@ -12,6 +12,8 @@ import pytest
 from radar import score
 
 RES = 1_772_000_000
+SNAP_MANIFEST = b'{"finished_at": "2026-06-01T00:00:00Z"}'   # QA N1: the scorer refuses a SNAP without finished_at
+T_SNAP = 1_780_272_000                                         # = 2026-06-01T00:00:00Z
 H = 3600
 PARAMS = """[params]
 p_low = 0.20
@@ -75,7 +77,7 @@ def make_snap(root: Path, trades, void=()):
                              "t_ref_unix": pa.array([RES - 1] * len(conds), pa.int64()),
                              "closed_at_delta_s": pa.array([0] * len(conds), pa.int64())}),
                    snap / "step4" / "resolutions_chain.parquet")
-    (snap / "manifest.json").write_bytes(b"{}")
+    (snap / "manifest.json").write_bytes(SNAP_MANIFEST)
     (snap / "step4" / "manifest.json").write_bytes(b"{}")
     return snap
 
@@ -122,7 +124,7 @@ def test_dense_scores_and_signals(tmp_path):
     assert nonprof > 0
     run = json.loads((d / "run.json").read_bytes())
     assert abs(sum(run["weights_applied"].values()) - 1) < 1e-12 and run["weights_pre_norm_sum"] > 0
-    assert run["snapshots"][0]["manifest_sha256"] == hashlib.sha256(b"{}").hexdigest()
+    assert run["snapshots"][0]["manifest_sha256"] == hashlib.sha256(SNAP_MANIFEST).hexdigest()
 
 
 def test_a4_recompute_detects_altered_weight(tmp_path):
@@ -208,7 +210,6 @@ def _prof_dir(root, wallet, shape):
     """Minimal PROF dir: one profiled wallet with a winning bet redeemed 2 h after resolution, dormant, snapshot +90 d."""
     d = root / "PROF-T"
     (d / "derived").mkdir(parents=True)
-    (d / "manifest.json").write_bytes(b"{}")
     pq.write_table(pa.table({"proxy_wallet": [wallet], "first_trade_unix": pa.array([RES - 86400], pa.int64()),
                              "first_funding_unix": pa.array([RES - 90000], pa.int64()), "lifetime_volume_usdc": [1e5],
                              "activity_status": ["ok"], "stats_status": ["ok"], "transfers_status": ["ok"],
@@ -221,8 +222,35 @@ def _prof_dir(root, wallet, shape):
                    d / "derived" / "trade_after.parquet")
     pq.write_table(pa.table({"proxy_wallet": [wallet], "direction": ["in"], "hop": pa.array([1], pa.int32()), "counterparty": ["0xf"],
                              "token": ["t"], "amount": [1.0], "n_logs": pa.array([1], pa.int64()), "first_ts_unix": pa.array([1], pa.int64()),
-                             "tx_hash": ["0x1"], "log_index": pa.array([1], pa.int64())}), d / "derived" / "transfers.parquet")
+                             "tx_hash": ["0x1"], "log_index": pa.array([1], pa.int64()), "via": [wallet], "selected": [False],
+                             "stop_listed": [False], "amount_raw": ["1000000"], "first_block": pa.array([1], pa.int64())}),
+                   d / "derived" / "transfers.parquet")
+    pq.write_table(pa.table({"proxy_wallet": [wallet, wallet], "direction": ["in", "out"], "hop": pa.array([1, 1], pa.int32()),
+                             "parent": [None, None], "address": [wallet, wallet], "status": ["ok", "ok"], "n_logs": pa.array([1, 0], pa.int64()),
+                             "to_block": pa.array([10, 10], pa.int64()), "to_block_ts": pa.array([RES + 10**8] * 2, pa.int64()),
+                             "gap_free": [True, True], "cache_hit": [False, False], "cache_fetched_at": [None, None],
+                             "fetch_file": ["fetch/a.json", "fetch/b.json"], "has_child_edges": [True, False]}), d / "derived" / "expansions.parquet")
+    (d / "raw").mkdir()
+    (d / "raw" / f"{wallet}.json").write_bytes(json.dumps({"wallet": wallet, "writer_id": WID}).encode())
+    write_prof_manifest(d)
     return d
+
+
+WID = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+
+def write_prof_manifest(d, wid=WID, prof_id="PROF-T"):
+    files = [{"path": f.relative_to(d).as_posix(), "sha256": hashlib.sha256(f.read_bytes()).hexdigest(), "kind": "bundle",
+              "writer_id": wid} for f in sorted((d / "raw").glob("*.json"))]
+    derived = [{"file": f.relative_to(d).as_posix(), "sha256": hashlib.sha256(f.read_bytes()).hexdigest()}
+               for f in sorted((d / "derived").glob("*.parquet"))]
+    (d / "manifest.json").write_bytes(json.dumps({"prof_id": prof_id, "files": files, "derived": derived}).encode())
+
+
+def pins_file(root, lines):
+    p = root / "WRITER_PINS.md"
+    p.write_text("# QA-held pin ledger (test)\n" + "".join(l + "\n" for l in lines))
+    return p
 
 
 def test_relay_hub_counts_only_when_decode_verified(tmp_path):
@@ -234,16 +262,19 @@ def test_relay_hub_counts_only_when_decode_verified(tmp_path):
     prof = _prof_dir(tmp_path, wallet, "relay_hub")
     s8 = lambda d: duckdb.connect().execute(f"SELECT component, na_reason FROM '{(Path(d) / 'signals.parquet').as_posix()}' "
                                             f"WHERE scope='all' AND proxy_wallet=? AND signal_id='S8'", [wallet]).fetchone()
-    r1 = score.run(snap, wf, pf2, prof, lock=lock, runs_dir=tmp_path / "r1")
+    pins = pins_file(tmp_path, [f"PIN | PROF-T | {WID} | 2026-09-27T09:00Z | QA"])
+    r1 = score.run(snap, wf, pf2, prof, lock=lock, runs_dir=tmp_path / "r1", pins=pins)
     assert s8(r1["dir"]) == (None, "auto_redeem_unknown")                        # no side-car -> unverified
     (prof / "s8check").mkdir()
     pq.write_table(pa.table({"proxy_wallet": [wallet], "condition_id": ["m1"], "shape_v2": ["relay_hub"], "decode_ok": [False]}),
                    prof / "s8check" / "shapes_v2.parquet")
-    r2 = score.run(snap, wf, pf2, prof, lock=lock, runs_dir=tmp_path / "r2")
+    write_prof_manifest(prof)
+    r2 = score.run(snap, wf, pf2, prof, lock=lock, runs_dir=tmp_path / "r2", pins=pins)
     assert s8(r2["dir"]) == (None, "auto_redeem_unknown")                        # decode failed
     pq.write_table(pa.table({"proxy_wallet": [wallet], "condition_id": ["m1"], "shape_v2": ["relay_hub"], "decode_ok": [True]}),
                    prof / "s8check" / "shapes_v2.parquet")
-    r3 = score.run(snap, wf, pf2, prof, lock=lock, runs_dir=tmp_path / "r3")
+    write_prof_manifest(prof)
+    r3 = score.run(snap, wf, pf2, prof, lock=lock, runs_dir=tmp_path / "r3", pins=pins)
     assert s8(r3["dir"])[1] is None and s8(r3["dir"])[0] > 0                    # verified -> counted
 
 
@@ -290,3 +321,54 @@ def test_export_writes_no_signed_zero(tmp_path, monkeypatch):
     assert neg(s["total_scorer"]) == 0 and neg(s["total_pipeline"]) == 0
     row = [i for i, (sc, w) in enumerate(zip(s["scope"], s["proxy_wallet"])) if sc == "all" and w == W(30)]
     assert row and s["total_scorer"][row[0]] == 0.0                     # the planted wallet is present with total 0
+
+
+
+# ---------------------------------------------------------------- r15 reader gate (Δ26/Δ29, QA C2/C3)
+def _gate_world(tmp_path):
+    snap, wf, lock = world(tmp_path)
+    prof = _prof_dir(tmp_path, W(11), "safe_exec")
+    return snap, wf, lock, prof
+
+
+def test_reader_accepts_only_pinned_writer_ids(tmp_path):
+    snap, wf, lock, prof = _gate_world(tmp_path)
+    ok = pins_file(tmp_path, [f"PIN | PROF-T | {WID} | 2026-09-27T09:00Z | QA"])
+    out = score.run(snap, wf, PARAMS_FILE, prof, lock=lock, runs_dir=tmp_path / "ok", pins=ok)
+    assert json.loads((Path(out["dir"]) / "run.json").read_bytes())["profile_gate"]["writer_ids"] == [WID]
+    other = pins_file(tmp_path, [f"PIN | PROF-X | {WID} | 2026-09-27T09:00Z | QA"])       # pinned for another PROF only
+    with pytest.raises(score.ScoreError, match="profile refused"):
+        score.run(snap, wf, PARAMS_FILE, prof, lock=lock, runs_dir=tmp_path / "r2", pins=other)
+    (tmp_path / "WRITER_PINS.md").unlink()
+    with pytest.raises(score.ScoreError, match="profile refused"):                     # no ledger -> refuse
+        score.run(snap, wf, PARAMS_FILE, prof, lock=lock, runs_dir=tmp_path / "r3", pins=tmp_path / "WRITER_PINS.md")
+
+
+def test_reader_refuses_missing_writer_id_and_prof001_files(tmp_path):
+    snap, wf, lock, prof = _gate_world(tmp_path)
+    pins = pins_file(tmp_path, [f"PIN | PROF-T | {WID} | 2026-09-27T09:00Z | QA"])
+    write_prof_manifest(prof, wid=None)                                                 # PROF-001 case: no writer id
+    with pytest.raises(score.ScoreError, match="missing or unpinned"):
+        score.run(snap, wf, PARAMS_FILE, prof, lock=lock, runs_dir=tmp_path / "a", pins=pins)
+    write_prof_manifest(prof)
+    old = tmp_path / "PROF-001"; old.mkdir()                                           # sibling PROF-001, prefreeze copy only
+    bundle = next((prof / "raw").glob("*.json"))
+    (old / "manifest_2026-09-27T0520Z_prefreeze.json").write_bytes(json.dumps(
+        {"files": [{"path": "raw/x.json", "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest()}]}).encode())
+    with pytest.raises(score.ScoreError, match="PROF-001"):
+        score.run(snap, wf, PARAMS_FILE, prof, lock=lock, runs_dir=tmp_path / "b", pins=pins)
+
+
+def test_reader_refuses_tampered_file(tmp_path):
+    snap, wf, lock, prof = _gate_world(tmp_path)
+    pins = pins_file(tmp_path, [f"PIN | PROF-T | {WID} | 2026-09-27T09:00Z | QA"])
+    next((prof / "raw").glob("*.json")).write_bytes(b'{"tampered": true}')
+    with pytest.raises(score.ScoreError, match="sha mismatch"):
+        score.run(snap, wf, PARAMS_FILE, prof, lock=lock, runs_dir=tmp_path / "c", pins=pins)
+
+
+def test_scorer_refuses_a_snap_without_finished_at(tmp_path):
+    snap, wf, lock = world(tmp_path)
+    (snap / "manifest.json").write_bytes(b"{}")
+    with pytest.raises(score.ScoreError, match="no finished_at"):
+        score.run(snap, wf, PARAMS_FILE, lock=lock, runs_dir=tmp_path / "r")

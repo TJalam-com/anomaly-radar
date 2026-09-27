@@ -209,27 +209,87 @@ def s5(con, P):
 
 # ---------------------------------------------------------------- profiled-only signals (S1, S2, S6, S8)
 
+def path_flags(con, P, edges=("in", "out")):
+    """r13 Δ14 (F-4) + r14 Δ21 + r15 Δ24/Δ25 + QA C5, per profiled wallet, as of t = P["_t_asof_unix"] (live: SNAP instant).
+    incomplete    : any expansion on the traced path is not (status ok AND gap-free sub-ranges AND to_block_ts >= t), or a
+                    selected counterparty has no fetch record at all. Hub-capped and stop-set nodes are design exclusions,
+                    never path expansions (Δ25).
+    breadth_trunc : some complete path node X at hop < s6_max_hops has C(X) (pre-t counterparties; stop set, fan-out hubs,
+                    hub-capped and the wallet excluded) with |C(X)| > breadth or C(X) not within F(X) (followed = selected
+                    AND complete AND (child edges OR a complete empty fetch)).
+    hub_capped    : number of selected counterparties on the path that were hub-capped (counted, never NA).
+    hop1_in_ok    : the wallet's own hop-1 'in' expansion is complete (S1 first_funding_ts is usable only then)."""
+    dirs = ",".join(f"'{d}'" for d in edges)
+    if P.get("_t_asof_unix") is None:     # QA: no fail-open default (t = 0 made every to_block_ts >= t trivially true)
+        raise ValueError("path_flags needs P['_t_asof_unix'] (the as-of instant t)")
+    t = int(P["_t_asof_unix"])
+    maxh, breadth, fan = int(P["s6_max_hops"]), int(P.get("s6_hop_breadth", 0)), int(P["s6_fanout_max"])   # v3: no breadth (hop-1 only)
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE path_flags AS
+        WITH prof AS (SELECT DISTINCT proxy_wallet FROM universe_t WHERE profiled),
+        ex AS (SELECT e.* FROM expansions e JOIN prof USING (proxy_wallet) WHERE e.direction IN ({dirs})),
+        node AS (SELECT proxy_wallet, direction, hop, address, n_logs, has_child_edges,
+                        (status = 'ok' AND coalesce(gap_free, FALSE) AND coalesce(to_block_ts, 0) >= {t}) AS complete
+                 FROM ex WHERE status <> 'hub'),
+        hub AS (SELECT proxy_wallet, direction, hop, address FROM ex WHERE status = 'hub'),
+        tr AS (SELECT t.* FROM transfers t JOIN prof USING (proxy_wallet) WHERE t.direction IN ({dirs})),
+        fanout AS (SELECT counterparty FROM tr GROUP BY 1 HAVING count(DISTINCT proxy_wallet) > {fan}),
+        missing AS (SELECT DISTINCT tr.proxy_wallet FROM tr
+                    WHERE tr.selected AND tr.hop < {maxh}
+                      AND NOT EXISTS (SELECT 1 FROM ex WHERE ex.proxy_wallet = tr.proxy_wallet AND ex.direction = tr.direction
+                                      AND ex.hop = tr.hop + 1 AND ex.address = tr.counterparty)),
+        cand AS (SELECT tr.proxy_wallet, tr.direction, tr.hop, tr.via, tr.counterparty, coalesce(tr.selected, FALSE) AS selected
+                 FROM tr JOIN node x ON x.proxy_wallet = tr.proxy_wallet AND x.direction = tr.direction AND x.hop = tr.hop
+                                      AND x.address = tr.via AND x.complete
+                 WHERE tr.hop < {maxh} AND epoch(tr.first_ts) < {t} AND NOT coalesce(tr.stop_listed, FALSE)
+                   AND tr.counterparty <> tr.proxy_wallet AND tr.counterparty NOT IN (SELECT address FROM stop_list)
+                   AND tr.counterparty NOT IN (SELECT counterparty FROM fanout)
+                   AND NOT EXISTS (SELECT 1 FROM hub h WHERE h.proxy_wallet = tr.proxy_wallet AND h.direction = tr.direction
+                                   AND h.hop = tr.hop + 1 AND h.address = tr.counterparty)),
+        foll AS (SELECT c.*, (c.selected AND coalesce(n.complete, FALSE) AND (coalesce(n.has_child_edges, FALSE) OR n.n_logs = 0)) AS followed
+                 FROM cand c LEFT JOIN node n ON n.proxy_wallet = c.proxy_wallet AND n.direction = c.direction
+                                              AND n.hop = c.hop + 1 AND n.address = c.counterparty),
+        trunc AS (SELECT proxy_wallet FROM foll GROUP BY proxy_wallet, direction, hop, via
+                  HAVING count(*) > {breadth} OR bool_or(NOT followed)),
+        inc AS (SELECT proxy_wallet FROM node WHERE NOT complete UNION SELECT proxy_wallet FROM missing
+                UNION SELECT p.proxy_wallet FROM prof p WHERE NOT EXISTS (SELECT 1 FROM ex WHERE ex.proxy_wallet = p.proxy_wallet AND ex.hop = 1))
+        SELECT p.proxy_wallet,
+               p.proxy_wallet IN (SELECT proxy_wallet FROM inc) AS incomplete,
+               p.proxy_wallet IN (SELECT proxy_wallet FROM trunc) AS breadth_trunc,
+               (SELECT count(*) FROM hub h WHERE h.proxy_wallet = p.proxy_wallet) AS hub_capped,
+               coalesce((SELECT bool_and(complete) FROM node n WHERE n.proxy_wallet = p.proxy_wallet AND n.hop = 1
+                         AND n.direction = 'in' AND n.address = p.proxy_wallet), FALSE) AS hop1_in_ok
+        FROM prof p""")
+
+
 def s1(con, P):
     rows = con.execute(f"""WITH tb AS (
             SELECT s.scope, f.proxy_wallet, min(epoch(f.ts)) AS t_bet
             FROM signal_fills f JOIN scope_map s USING (condition_id)
             WHERE f.walk = 'all' AND f.side = 'BUY' AND {stake()} >= {dec(P['s1_min_stake'])} GROUP BY 1, 2)
         SELECT u.scope, u.proxy_wallet, p.activity_status, epoch(p.first_trade_ts), epoch(p.first_funding_ts), tb.t_bet,
-               p.funding_truncated, epoch(p.lower_bound_ts)
+               p.funding_truncated, epoch(p.lower_bound_ts), coalesce(pf.hop1_in_ok, FALSE)
         FROM universe_t u LEFT JOIN wallet_profile p USING (proxy_wallet)
              LEFT JOIN tb ON tb.scope = u.scope AND tb.proxy_wallet = u.proxy_wallet
+             LEFT JOIN path_flags pf ON pf.proxy_wallet = u.proxy_wallet
         WHERE u.profiled""").fetchall()
     out = []
-    for sc, w, st, ftt, fft, tbet, trunc, lb_ts in rows:
+    for sc, w, st, ftt, fft, tbet, trunc, lb_ts, hop1_ok in rows:
         if st is None or st == "unavailable":
             out.append((sc, w, None, None, "activity_unavailable", {})); continue
-        if trunc:
+        if not hop1_ok:
+            # r14 Δ22 / r15 Δ31: funding from an incomplete (or unrecorded) hop-1 'in' expansion is not usable.
+            # Fallback t0 = first trade only when it predates the funding search window (inactive while the bound is 0).
+            if ftt is not None and lb_ts is not None and ftt < lb_ts:
+                cands = [ftt]
+            else:
+                out.append((sc, w, None, None, "transfers_unverified", {})); continue
+        elif trunc:
             # QA funding-window rule (corrected): funding may predate the search window
             if ftt is not None and lb_ts is not None and ftt < lb_ts:
                 cands = [ftt]            # provably old wallet -> t0 from first trade
             else:
                 out.append((sc, w, None, None, "funding_window_truncated", {})); continue
-        else:
+        elif hop1_ok:
             cands = [x for x in (ftt, fft) if x is not None]
         if not cands:
             out.append((sc, w, None, None, "no_first_ts", {})); continue
@@ -274,23 +334,152 @@ def s6(con, P, edges=("in", "out")):
             FROM links a JOIN links b ON a.counterparty = b.counterparty AND a.proxy_wallet <> b.proxy_wallet),
         ne AS (SELECT proxy_wallet, count(*) AS n FROM transfers GROUP BY 1)
         SELECT u.scope, u.proxy_wallet, p.transfers_status, coalesce(ne.n, 0),
-               count(DISTINCT CASE WHEN u2.profiled THEN pair.o END), bool_or(p.funding_truncated)
+               count(DISTINCT CASE WHEN u2.profiled THEN pair.o END), bool_or(p.funding_truncated),
+               coalesce(any_value(pf.incomplete), TRUE), coalesce(any_value(pf.breadth_trunc), FALSE), coalesce(any_value(pf.hub_capped), 0)
         FROM universe_t u LEFT JOIN wallet_profile p USING (proxy_wallet) LEFT JOIN ne USING (proxy_wallet)
              LEFT JOIN pair ON pair.w = u.proxy_wallet
              LEFT JOIN universe_t u2 ON u2.scope = u.scope AND u2.proxy_wallet = pair.o
+             LEFT JOIN path_flags pf ON pf.proxy_wallet = u.proxy_wallet
         WHERE u.profiled GROUP BY 1, 2, 3, 4""").fetchall()
     out = []
-    for sc, w, st, n_edges, linked, trunc in rows:
+    for sc, w, st, n_edges, linked, trunc, incomplete, btrunc, hubs in rows:
+        flags = {"hub_capped": int(hubs)} if hubs else {}
         if st is None or st == "unavailable":
             out.append((sc, w, None, None, "transfers_unavailable", {}))
+        elif linked == 0 and incomplete:          # a negative needs every path expansion complete (F-4); C5: wins
+            out.append((sc, w, None, None, "transfers_unverified", {**flags, **({"breadth_truncated_path": True} if btrunc else {})}))
+        elif linked == 0 and btrunc:              # a pre-t counterparty left unfollowed by the breadth cap (r15 Δ24)
+            out.append((sc, w, None, None, "breadth_truncated", flags))
         elif not n_edges:
-            out.append((sc, w, None, None, "no_transfers_found", {}))
+            out.append((sc, w, None, None, "no_transfers_found", flags))
         else:
-            ev = {"edges": list(edges)}
+            ev = {"edges": list(edges), **flags}
             if trunc:
                 ev["edges_possibly_incomplete"] = True   # QA funding-window rule
+            if linked > 0 and incomplete:
+                ev["incomplete_path"] = True             # U14: found link on an incomplete path (counted, marked)
+            if linked > 0 and btrunc:
+                ev["breadth_truncated_path"] = True
             out.append((sc, w, float(linked), clip01(linked / P["s6_full_at"]), None, ev))
     _sparse(con, "S6", out)
+
+
+def graded(linked, K):
+    """params v3 s6_component graded_log: min(1, ln(1 + linked) / ln(1 + K))."""
+    return min(1.0, math.log1p(linked) / math.log1p(K))
+
+
+def s6_v3(con, P, edges=("in", "out")):
+    """S6 v3 (params v3; D1 notes r16-r16d). t = P['_t_asof_unix'] with block(t) = P['_block_t'] (last block with ts < t):
+    the SNAP instant for live scopes, T_cut(m, h) in replay cells. G = P['_s6_G'] (from the QA-recorded G record; required).
+    Link edge: hop-1 transfer w<->X (in or out), first_block <= block(t), X not stop-listed. Lookup set L: X shared by >= 2 profiled
+    wallets, >= 1 natural (natural = passed_prefilter in scope 'all'). Qualifying: X in L, lookup complete at t, activity_at <= G.
+    linked(w) = #natural v != w sharing a qualifying X (for every scored w, bypass included; bypass-bypass never links).
+    NA: transfers_unavailable > transfers_unverified (own hop-1 record incomplete) > activity_unverified (a shared lookup missing or
+    incomplete) > no_transfers_found; the two 'unverified' reasons apply ONLY when the verified component < 1.0 (R16B-2 (i)); at 1.0
+    the value stands, evidence incomplete_path = true, counted in n_s6_positive_on_incomplete_path.
+    edges (Planner V1-1 sensitivity mode, --s6-edges in): the LINK edges and the NA/verified computation use only these directions;
+    the lookup set, the lookup records and G stay the ones of the default run (G is never re-derived here)."""
+    from radar import knee_g
+    if "_s6_G" not in P or "_block_t" not in P or "_t_asof_unix" not in P or P["_t_asof_unix"] is None:
+        raise ValueError("S6 v3 needs P['_s6_G'] (recorded G), P['_block_t'] (block(t)) and P['_t_asof_unix'] (t; no default)")
+    G, bt, K, t = int(P["_s6_G"]), int(P["_block_t"]), float(P["s6_graded_k"]), int(P["_t_asof_unix"])
+    # R15V3-1: one t per call and a per-wallet cache -> live scopes only; any replay scope must go through a per-cell path (not built yet)
+    live_conds = {r[0] for r in con.execute("SELECT condition_id FROM markets_r").fetchall()}
+    bad = [sc for (sc,) in con.execute("SELECT DISTINCT scope FROM universe_t").fetchall()
+           if not (sc == "all" or sc in live_conds or sc.startswith("event:"))]
+    if bad:
+        raise ValueError(f"S6 v3 has no per-cell (replay) path: refusing non-live scopes {sorted(bad)[:3]}")
+    prof = {w: bool(n) for w, n in con.execute(
+        "SELECT proxy_wallet, bool_or(passed_prefilter) FROM universe_t WHERE scope = 'all' AND profiled GROUP BY 1").fetchall()}
+    natural = {w for w, n in prof.items() if n}
+    link_dirs = tuple(edges)
+    all_edges = con.execute(f"""SELECT DISTINCT t.proxy_wallet, lower(t.counterparty), t.direction FROM transfers t
+        WHERE t.hop = 1 AND t.direction IN ('in', 'out') AND t.first_block IS NOT NULL AND t.first_block <= {bt}
+          AND lower(t.counterparty) NOT IN (SELECT lower(address) FROM stop_list)""").fetchall()
+    by_x_all, by_x = defaultdict(set), defaultdict(set)
+    for w, x, d in all_edges:
+        if w in prof and x != w:
+            by_x_all[x].add(w)                     # lookup set: both directions, whatever the edge mode (same L as the default run)
+            if d in link_dirs:
+                by_x[x].add(w)                     # link edges: the selected directions only
+    L = {x for x, ws in by_x_all.items() if len(ws) >= 2 and ws & natural}
+    recs = {}
+    for a, status, capped, cap_block, from_block, to_block, subs in con.execute(
+            "SELECT address, status, capped, cap_block, from_block, to_block, subranges_json FROM lookups").fetchall():
+        recs[a.lower()] = {"status": status, "capped": bool(capped), "cap_block": cap_block, "from_block": from_block,
+                           "to_block": to_block, "subranges": json.loads(subs or "[]"), "first_blocks": []}
+    for a, fb in con.execute("SELECT address, first_block FROM lookup_y").fetchall():
+        if a.lower() in recs:
+            recs[a.lower()]["first_blocks"].append(fb)
+    complete, qualifying, n_capped = set(), set(), 0
+    for x in L:
+        r = recs.get(x)
+        if r is not None and knee_g.complete_at(r, bt):
+            complete.add(x)
+            act = knee_g.activity_at(r, bt)
+            n_capped += act is None
+            if act is not None and act <= G:
+                qualifying.add(x)
+    w_x = defaultdict(set)
+    for x, ws in by_x.items():
+        for w in ws:
+            w_x[w].add(x)
+    exp_ok = {}
+    for w, d, st, gf, tbt in con.execute("SELECT proxy_wallet, direction, status, gap_free, to_block_ts FROM expansions WHERE hop = 1").fetchall():
+        exp_ok.setdefault(w, {})[d] = (st == "ok" and bool(gf) and (tbt or 0) >= t)
+    dl = ",".join(f"'{d}'" for d in link_dirs)
+    ne = dict(con.execute(f"""SELECT proxy_wallet, count(*) FROM transfers WHERE hop = 1 AND first_block IS NOT NULL
+        AND first_block <= {bt} AND direction IN ({dl}) GROUP BY 1""").fetchall())   # R15V3-5 as-of; V1-1: link directions only
+    status = dict(con.execute("SELECT proxy_wallet, transfers_status FROM wallet_profile").fetchall())
+    rows = con.execute("SELECT scope, proxy_wallet FROM universe_t WHERE profiled ORDER BY 1, 2").fetchall()
+    out, per_w = [], {}
+    for sc, w in rows:
+        if w not in per_w:
+            partners = set()
+            unverified = False
+            for x in w_x.get(w, ()):
+                others = (by_x[x] & natural) - {w}
+                if not others or x not in L:
+                    continue
+                if x in qualifying:
+                    partners |= others
+                elif x not in complete:
+                    unverified = True
+            linked = len(partners)
+            comp = graded(linked, K)
+            e = exp_ok.get(w, {})
+            own_incomplete = not all(e.get(d) for d in link_dirs)      # V1-1: only the records of the link directions matter
+            st = status.get(w)
+            if st is None or st in ("unavailable", "capped"):
+                res = (None, None, "transfers_unavailable", {})
+            elif own_incomplete and comp < 1.0:
+                res = (None, None, "transfers_unverified", {})
+            elif unverified and comp < 1.0:
+                res = (None, None, "activity_unverified", {})
+            elif not ne.get(w):
+                res = (None, None, "no_transfers_found", {})
+            else:
+                ev = {"rule": "C1", "G": G}
+                if own_incomplete or unverified:
+                    ev["incomplete_path"] = True      # value 1.0 stands (verified links saturate); marked + counted
+                res = (float(linked), comp, None, ev)
+            per_w[w] = res
+        out.append((sc, w, *per_w[w]))
+    _sparse(con, "S6", out)
+    counts = defaultdict(lambda: defaultdict(int))
+    for sc, w, raw, comp, na, ev in out:
+        c = counts[sc]
+        c["n_activity_unverified"] += na == "activity_unverified"
+        c["n_transfers_unverified"] += na == "transfers_unverified"
+        c["n_s6_positive"] += bool(raw)
+        c["n_s6_positive_on_incomplete_path"] += bool(raw) and bool(ev.get("incomplete_path"))
+    con.execute("""CREATE OR REPLACE TEMP TABLE s6v3_counts(scope TEXT, n_lookup_set BIGINT, n_lookup_complete BIGINT,
+        n_lookup_incomplete BIGINT, n_capped_at_t BIGINT, n_activity_unverified BIGINT, n_transfers_unverified BIGINT,
+        n_s6_positive BIGINT, n_s6_positive_on_incomplete_path BIGINT)""")
+    for sc, c in sorted(counts.items()):
+        con.execute("INSERT INTO s6v3_counts VALUES (?,?,?,?,?,?,?,?,?)", [sc, len(L), len(complete), len(L) - len(complete), n_capped,
+                    c["n_activity_unverified"], c["n_transfers_unverified"], c["n_s6_positive"], c["n_s6_positive_on_incomplete_path"]])
 
 
 def s8(con, P):
@@ -348,8 +537,11 @@ def s8(con, P):
 def compute_all(con, P, s6_edges=("in", "out")):
     """Fill sig_sparse, then create TEMP TABLE signals_dense: every (scope, wallet in U, S1..S8)."""
     universe(con, P)
+    path_flags(con, P, s6_edges)
     s3(con, P); s7(con, P); s4(con, P); s5(con, P)
-    s1(con, P); s2(con, P); s6(con, P, s6_edges); s8(con, P)
+    s1(con, P); s2(con, P)
+    s6_v3(con, P, s6_edges) if P.get("s6_rule") == "C1" else s6(con, P, s6_edges)   # params v3 -> S6 v3; v2 -> r15 S6
+    s8(con, P)
     dup = con.execute("SELECT count(*) FROM (SELECT scope, proxy_wallet, signal_id FROM sig_sparse GROUP BY 1,2,3 HAVING count(*) > 1)").fetchone()[0]
     if dup:
         raise RuntimeError(f"{dup} duplicate sparse signal rows")
