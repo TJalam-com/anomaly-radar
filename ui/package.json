@@ -1,0 +1,24 @@
+{
+  "name": "anomaly-radar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Anomaly Radar UI (G6). Read-only; localhost only.",
+  "scripts": {
+    "dev": "NEXT_TELEMETRY_DISABLED=1 next dev -H 127.0.0.1 -p 3000",
+    "build": "NEXT_TELEMETRY_DISABLED=1 ANOMALY_RADAR_DIST=.next-dev next build",
+    "build:review": "NEXT_TELEMETRY_DISABLED=1 ANOMALY_RADAR_DIST=.next-stage next build",
+    "start": "NEXT_TELEMETRY_DISABLED=1 next start -H 127.0.0.1 -p 3000"
+  },
+  "dependencies": {
+    "cytoscape": "^3.34.3",
+    "next": "^15.5.26",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.6.1",
+    "postcss": "^8.5.28",
+    "tailwindcss": "^3.4.19"
+  }
+}

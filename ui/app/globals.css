@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* D5 visual system: neutral palette; colour only for the score scale; NA neutral grey; visible keyboard focus;
+   tap targets >= 24x24 px; text >= 12 px (T-11). */
+@layer base {
+  html { font-size: 16px; }
+  body { @apply bg-slate-50 text-slate-900; }
+  :focus-visible { outline: 2px solid #0f172a; outline-offset: 2px; border-radius: 3px; }
+  table { border-collapse: collapse; }
+}
+
+@layer components {
+  .card { @apply rounded-lg border border-slate-200 bg-white p-4 shadow-sm; }
+  .card-title { @apply text-sm font-semibold text-slate-800; }
+  .muted { @apply text-slate-500; }
+  .text-2xs { font-size: 12px; line-height: 16px; }
+  .pager-btn { @apply inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded border border-slate-300 bg-white px-2 text-slate-700 hover:bg-slate-100; }
+  .pager-current { @apply border-slate-800 bg-slate-800 font-semibold text-white hover:bg-slate-800; }
+  .icon-btn { @apply inline-flex h-7 w-7 items-center justify-center rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-100; }
+  .na-badge { @apply inline-flex min-h-[24px] items-center rounded border border-slate-300 bg-slate-50 px-1.5 text-slate-600; font-size: 12px; }
+  .chip { @apply inline-flex items-center gap-1 rounded-full border border-slate-300 bg-white px-2 py-0.5 text-slate-700; font-size: 12px; }
+  .trust-icon { @apply inline-flex items-center gap-1 rounded border border-slate-300 bg-slate-100 px-1.5 text-slate-700; font-size: 12px; min-height: 24px; }
+  .th { @apply px-2 py-2 text-left align-bottom font-medium text-slate-600; font-size: 12px; }
+  .td { @apply px-2 py-2 align-top; }
+  /* relative: absolutely positioned children (sr-only text) are clipped by the scroller instead of widening the page */
+  .scroll-x { @apply relative w-full overflow-x-auto; }
+  .skip-link { @apply sr-only; }
+  .skip-link:focus { @apply not-sr-only fixed left-2 top-2 z-50 rounded bg-slate-900 px-3 py-2 text-white; }
+}

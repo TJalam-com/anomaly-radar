@@ -1,0 +1,44 @@
+# Frozen parameters v2 for G4. Supersedes v1 (config/params_frozen_2026-09-26.toml, sha256 467a62fb…836a, kept as history).
+# v2 change (QA pre-registration ruling 2026-09-26 ~20:1xZ, before any S8 score existed): S8 user-signed redeem shapes.
+# Reason: relay_hub is 54% of first redeems; 40/40 decoded relay_hub txs were signed by the wallet owner (signer == from,
+# CREATE2(Proxy Wallet Factory, keccak(from)) == wallet); 33/33 direct factory.proxy calls were from the owner.
+# Disclosure: "owner-signed" proves the wallet key signed the call, not that a human clicked; embedded-wallet setups where a
+# provider session signs for the user cannot be distinguished. The proxy init-code hash used for CREATE2 was recalled from
+# Polymarket client libraries, accepted because it reproduced 40/40 wallet addresses exactly.
+# Frozen BEFORE any profile data was fetched and before any look-half score. Every run records this file's sha256.
+# Any change = new pre-registration via QA, disclosed; never edited in place.
+version = "params-2026-09-27-2"
+
+[params]
+p_low = 0.20            # low-odds price threshold (S3, S7, prefilter)
+pre_min_stake = 1000    # prefilter: S3 raw over scope 'all' >= this (USDC)
+s1_min_stake = 1000     # S1 qualifying first bet (USDC, single leg)
+s1_fresh_h = 48         # S1 component 1 at or below this age (hours)
+s1_stale_h = 720        # S1 component 0 at or above this age (hours)
+s3_min_stake = 1000     # S3 floor (USDC)
+s3_cap_usdc = 100000    # S3 cap (USDC)
+s4_lead_h = 24          # S4 lead window (hours); anchor precision >= lead -> NA (r7 example, QA confirmed)
+s4_min_stake = 1000     # S4 floor on window stake (USDC)
+s4_cap_usdc = 50000     # S4 cap (USDC)
+s5_full_at = 6.0        # S5 component 1 at -log10(p) >= this
+s5_min_bets = 3         # S5 minimum resolved non-void bets
+s6_max_hops = 3         # S6 funding/destination hops
+s6_full_at = 5          # S6 component 1 at this many linked wallets
+s6_fanout_max = 20      # S6: counterparty linking more profiled wallets than this = shared hub
+s6_hop_breadth = 3      # S6: hops >= 2 follow the top-N counterparties by amount
+s7_min_stake = 1000     # S7 qualifying buy (USDC, single leg)
+s7_window_s = 600       # S7 co-buy window (seconds)
+s7_full_at = 5          # S7 component 1 at this many co-buyers
+s8_quick_h = 24         # S8 quick exit window after resolution (hours)
+s8_dormant_d = 30       # S8 dormancy window after redeem (days)
+
+[fetch]                 # profile-fetch constants (radar/profile.py), frozen with the params
+funding_lower_bound_block = 0     # transfer search starts at genesis (not 75,000,000)
+funding_truncation_window_blocks = 1000000   # QA rule: earliest in-window inbound within this many blocks of the bound -> truncated
+hop1_log_cap = 50000    # hop-1 logs per direction above this -> 'capped' -> S6 NA 'transfers_unavailable'
+hop_n_hub_cap = 5000    # hop >= 2 counterparty with more logs than this = hub, not followed
+user_signed_redeem_shapes = ["safe_exec", "direct_eoa", "relay_hub", "factory_direct"]
+relay_hub_requires_decode = true   # relay_hub counts only if the per-tx decode shows signer == from AND CREATE2(from) == wallet (full, every REDEEM)
+factory_direct_rule = "tx.to == 0xab45c5a4b0c941a2f231c04c3f49182e1a254052 AND selector 0x34ee9791 AND CREATE2(tx.from) == wallet"
+proxy_init_code_hash = "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+# NA auto_redeem_unknown: erc4337 (EntryPoint v0.6/v0.7), MetaMask Delegation Manager, ERC-7579 execute, foreign Safe, other

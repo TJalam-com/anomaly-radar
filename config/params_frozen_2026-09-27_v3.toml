@@ -1,0 +1,87 @@
+# ==== Frozen parameters v3 (S6-V1, design notes r16–r16d). Locked by QA; never edited in place. ====
+# v3 change (D1 design notes r16 / r16a / r16b, S6-V1; QA rulings R16-1..5 and R16A-1..8, 2026-09-27): S6 redefined
+# on STRUCTURAL evidence only (no control outcome computed or seen). r3: rulings R16B-1..3 (D1 note r16c). r4: R16C-1..2 (r16d). Linked = share a DIRECT (hop-1) counterparty, inbound
+# funder OR outbound destination; partners counted in the NATURAL universe only; a counterparty links only if its
+# two-direction transfer activity is <= G, G derived BLIND from the PROF-002 lookups by the pre-registered knee formula below
+# and recorded by QA before any score; graded component. Removed vs v2: s6_full_at (replaced by the graded component),
+# s6_hop_breadth (hops >= 2 no longer feed S6), s6_max_hops 3 -> 1; s6_fanout_max 20 -> 0 (F OFF). The PROF-001 G = 63
+# figure (one-direction proxy, biased population) is disclosed as a proxy only and is NOT used.
+# Copied from scratch draft r4 f61ee9f0… and hash-locked by QA (QA-held lock).
+#
+# ---- history carried from v2 (params_frozen_2026-09-27_v2.toml, sha256 080cbbd0…), verbatim:
+# Frozen parameters v2 for G4. Supersedes v1 (config/params_frozen_2026-09-26.toml, sha256 467a62fb…836a, kept as history).
+# v2 change (QA pre-registration ruling 2026-09-26 ~20:1xZ, before any S8 score existed): S8 user-signed redeem shapes.
+# Reason: relay_hub is 54% of first redeems; 40/40 decoded relay_hub txs were signed by the wallet owner (signer == from,
+# CREATE2(Proxy Wallet Factory, keccak(from)) == wallet); 33/33 direct factory.proxy calls were from the owner.
+# Disclosure: "owner-signed" proves the wallet key signed the call, not that a human clicked; embedded-wallet setups where a
+# provider session signs for the user cannot be distinguished. The proxy init-code hash used for CREATE2 was recalled from
+# Polymarket client libraries, accepted because it reproduced 40/40 wallet addresses exactly.
+# Frozen BEFORE any profile data was fetched and before any look-half score. Every run records this file's sha256.
+# Any change = new pre-registration via QA, disclosed; never edited in place.
+version = "params-v3"
+
+[params]
+p_low = 0.20            # low-odds price threshold (S3, S7, prefilter)
+pre_min_stake = 1000    # prefilter: S3 raw over scope 'all' >= this (USDC)
+s1_min_stake = 1000     # S1 qualifying first bet (USDC, single leg)
+s1_fresh_h = 48         # S1 component 1 at or below this age (hours)
+s1_stale_h = 720        # S1 component 0 at or above this age (hours)
+s3_min_stake = 1000     # S3 floor (USDC)
+s3_cap_usdc = 100000    # S3 cap (USDC)
+s4_lead_h = 24          # S4 lead window (hours); anchor precision >= lead -> NA (r7 example, QA confirmed)
+s4_min_stake = 1000     # S4 floor on window stake (USDC)
+s4_cap_usdc = 50000     # S4 cap (USDC)
+s5_full_at = 6.0        # S5 component 1 at -log10(p) >= this
+s5_min_bets = 3         # S5 minimum resolved non-void bets
+s6_rule = "C1"          # linked = share a hop-1 counterparty X (inbound funder OR outbound destination), X not stop-listed
+s6_max_hops = 1         # v2: 3. Hops 2..3 no longer feed S6
+s6_partner_universe = "natural"   # R16A-5: linked(w) counts partners in the NATURAL universe only (prefilter-derived targets),
+                                  # for EVERY scored wallet incl. bypass-injected ones; co-injected wallets never link to each other
+s6_lookup_set = "hop1_shared_by_ge2_wallets_with_ge1_natural"   # counterparties that need an activity lookup
+s6_fanout_max = 0       # F OFF (v2: 20). Fan is not a link rule; counted over the natural universe for diagnostics only
+s6_fan_universe = "natural"
+s6_activity_measure = "two_direction_distinct"   # activity(X,t) = #distinct Y != X with a traced-token Transfer X->Y or Y->X, block <= block(t)
+s6_activity_cap = 257   # C: lookup stops at 257 distinct counterparties (capped = activity > 256)
+s6_activity_max = "derived"       # G: NOT a number here. Derived BLIND from the PROF-002 lookup records by s6_g_formula, before any
+                                  # score; reported to QA with the histogram, recomputed independently by Tester 1, recorded by QA
+s6_g_population = "as-of activity at block(SNAP) of complete lookup records of counterparties shared by >= 2 NATURAL wallets only (R16B-1, R16B-3); natural-and-bypass-only counterparties are looked up but never enter the histogram; only capped_at_t records go to the terminal bin (R16C-2)"
+s6_g_bins = "k = floor(log2(max(1, activity))) for k = 0..7 (activity 0..255); terminal bin k = 8 holds every activity >= 256, capped included"
+s6_g_formula = "mode = bin k in 0..7 with the largest count (ties: lowest k); from k = mode+1 upward, the first bin with count(k) < 0.5 * count(k-1) gives G = 2^k - 1; no such bin up to k = 8 -> G = 256; clamp G to [16, 256]; bins 0..7 all empty -> G undefined: stop, report to QA, no fallback value"
+s6_g_drop_ratio = 0.5
+s6_g_clamp_min = 16
+s6_g_clamp_max = 256
+s6_g_reference_impl = "scratch/developer/r16/knee_g.py: activity_at (shared by G and the scorer) + g_population + g_from_activities (copied into radar/ with the r15 build; Tester 1 recomputes independently)"
+s6_g_replay = "single_global"   # R16B-3: replay cells use this one G (global structural threshold from post-cut lookup data, disclosed)
+s6_t_scope = "t = SNAP instant for the G population and live scopes; replay cells use t = T_cut(m, h) for the link-edge cut and the as-of activity, with the single recorded G (R16C-1)"
+s6_capped_at_t = "capped AND cap_block <= block(t) -> activity > 256 (terminal / > G); a cap reached after block(t) -> exact count of first_block <= block(t) (R16C-2)"
+s6_activity_unknown = "no_link"   # a counterparty with a missing / incomplete lookup never makes a link
+s6_unverified_rule = "na_only_if_verified_component_lt_1"   # R16A-3 + R16B-2 (i): 'transfers_unverified' (own hop-1 record
+                                  # incomplete) and 'activity_unverified' (a shared lookup missing/incomplete) apply ONLY when the
+                                  # VERIFIED component (links found through complete lookups) is < 1.0; at 1.0 the value stands and
+                                  # the wallet is counted in n_s6_positive_on_incomplete_path. Supersedes F-4 "flag, not NA" for S6 v3
+s6_block_cut = "last_block_with_ts_lt_T"     # R16A-7: block(T) = the last block with timestamp < T (strict)
+s6_component = "graded_log"       # component = min(1, ln(1 + linked) / ln(1 + K)); replaces linked / s6_full_at
+s6_graded_k = 20        # K
+s7_min_stake = 1000     # S7 qualifying buy (USDC, single leg)
+s7_window_s = 600       # S7 co-buy window (seconds)
+s7_full_at = 5          # S7 component 1 at this many co-buyers
+s8_quick_h = 24         # S8 quick exit window after resolution (hours)
+s8_dormant_d = 30       # S8 dormancy window after redeem (days)
+
+[fetch]                 # profile-fetch constants (radar/profile.py), frozen with the params
+funding_lower_bound_block = 0     # transfer search starts at genesis (not 75,000,000)
+funding_truncation_window_blocks = 1000000   # QA rule: earliest in-window inbound within this many blocks of the bound -> truncated
+hop1_log_cap = 50000    # hop-1 logs per direction above this -> 'capped' -> S6 NA 'transfers_unavailable'
+hop_n_hub_cap = 5000    # kept for the fetch record only (hops >= 2 are not fetched for S6 under s6_max_hops = 1)
+activity_lookup = "capped_transfer_log_count"  # per lookup-set counterparty X: eth_getLogs, 3 traced tokens x 2 topic streams
+                                               # (topic1 = X, topic2 = X), ascending from genesis with range bisection
+activity_merge_order = "per_range_both_streams_by_block_log_index"   # R16A-6: for each bisected range [lo, hi] fetch BOTH streams x
+                                               # 3 tokens, merge by (block, log_index), then accumulate distinct Y; cap_block and
+                                               # first_block(Y) come from that single global order
+activity_record = "n_distinct, capped, cap_block, first_block per Y (<= C), to_block, to_block_ts, subranges, gap_free"
+activity_lookup_prefilter = "none"             # an optional getCode/nonce pre-filter may only DROP (latest-state: never admits)
+user_signed_redeem_shapes = ["safe_exec", "direct_eoa", "relay_hub", "factory_direct"]
+relay_hub_requires_decode = true   # relay_hub counts only if the per-tx decode shows signer == from AND CREATE2(from) == wallet (full, every REDEEM)
+factory_direct_rule = "tx.to == 0xab45c5a4b0c941a2f231c04c3f49182e1a254052 AND selector 0x34ee9791 AND CREATE2(tx.from) == wallet"
+proxy_init_code_hash = "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+# NA auto_redeem_unknown: erc4337 (EntryPoint v0.6/v0.7), MetaMask Delegation Manager, ERC-7579 execute, foreign Safe, other
