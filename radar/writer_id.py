@@ -1,9 +1,20 @@
 """Profile writer identity (design notes r14 Δ18, r15 Δ26/Δ27; QA conditions C1–C3 on r15).
 
-writer_id = sha256 of the canonical JSON of the sorted code closure: every radar module loaded in the writer process
-(module path relative to the app dir, file sha256), the interpreter version, the uv.lock sha, the installed versions
-of duckdb / pyarrow / httpx, and the params file bytes. The closure is recorded in every profile file's manifest entry
-context; the pin lives only in the QA-held ledger/WRITER_PINS.md (no allow-list: C2).
+CANONICAL DEFINITION (D1 note r16g; recompute it from this text, not from this code):
+  entries, each a list of three strings [kind, name, value]:
+    ["module", <path of the file relative to the app dir, "/" separators>, <sha256 hex, lower case, of the file bytes>]
+        for EVERY file matching radar/**/*.py on disk (the whole package, imported or not, incl. radar/profile.py run as
+        __main__), excluding any path with a "__pycache__" component;
+    ["python", "version", <sys.version, the full string>];
+    ["lockfile", "uv.lock", <sha256 hex of app/uv.lock bytes, or "missing">];
+    ["library", <name>, <importlib.metadata.version(name), or "missing">] for name in duckdb, pyarrow, httpx;
+    ["params", <basename of the params file>, <sha256 hex of the params file bytes>].
+  order: sorted(entries) (Python list order: by kind, then name, then value; plain code-point comparison).
+  bytes: json.dumps(entries, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"): no spaces, no newline.
+  writer_id = sha256 hex (lower case) of those bytes.
+The closure is recorded in the manifest (writer_closure); the pin lives only in the QA-held ledger/WRITER_PINS.md (no allow-list: C2).
+Until r16g the modules were "those loaded in sys.modules", which missed radar/profile.py under `python -m radar.profile` and the
+lazily imported radar/activity.py / knee_g.py (Developer finding 2026-09-27; that writer_id was never pinned).
 
 WRITER_PINS.md line format (C1, verbatim):  PIN | <PROF id> | <writer_id 64 hex> | <instant> | QA
 Only lines starting "PIN |" are parsed; a PROF id may have several PIN lines.
@@ -31,11 +42,10 @@ def closure(app_dir: Path, params_path: Path) -> list:
     """Sorted list of [kind, name, value] describing everything that decides the writer's output."""
     app_dir = Path(app_dir).resolve()
     items = []
-    for name, mod in sorted(sys.modules.items()):
-        f = getattr(mod, "__file__", None)
-        if (name == "radar" or name.startswith("radar.")) and f:
-            p = Path(f).resolve()
-            items.append(["module", p.relative_to(app_dir).as_posix(), _sha(p)])
+    for p in sorted((app_dir / "radar").rglob("*.py")):          # r16g: every package file on disk, not the loaded modules
+        if "__pycache__" in p.relative_to(app_dir).parts:
+            continue
+        items.append(["module", p.relative_to(app_dir).as_posix(), _sha(p)])
     items.append(["python", "version", sys.version])
     lock = app_dir / "uv.lock"
     items.append(["lockfile", "uv.lock", _sha(lock) if lock.exists() else "missing"])
@@ -49,7 +59,7 @@ def closure(app_dir: Path, params_path: Path) -> list:
 
 
 def writer_id(items: list) -> str:
-    return hashlib.sha256(json.dumps(items, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(sorted(items), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
 def assert_unchanged(items: list, app_dir: Path, params_path: Path) -> None:

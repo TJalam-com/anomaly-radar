@@ -186,27 +186,56 @@ def test_follow_rule_independent_of_rpc_order():
     assert sel[0] == sel[1] and len(sel[0]) == 2          # ties -> (first_block, first_log_index, address): same pick
 
 
-def test_writer_id_covers_every_module_in_closure(tmp_path, monkeypatch):
-    import sys, types
-    from radar import writer_id as W
-    app = tmp_path / "app"; (app / "radar").mkdir(parents=True)
-    for n in ("profile.py", "entities.py"):
-        (app / "radar" / n).write_text(f"# {n}\n")
+def _wid_app(tmp_path):
+    app = tmp_path / "app"
+    for rel in ("radar/profile.py", "radar/entities.py", "radar/activity.py", "radar/vendor/v.py", "radar/__pycache__/junk.py"):
+        (app / rel).parent.mkdir(parents=True, exist_ok=True)
+        (app / rel).write_text(f"# {rel}\n")
     (app / "uv.lock").write_text("lock\n")
     prm = tmp_path / "params.toml"; prm.write_text("[params]\n")
-    fake = {}
-    for n in ("profile", "entities"):
-        m = types.ModuleType(f"radar.{n}"); m.__file__ = str(app / "radar" / f"{n}.py")
-        fake[f"radar.{n}"] = m
-    others = {k: v for k, v in sys.modules.items() if not (k == "radar" or k.startswith("radar."))}
-    monkeypatch.setattr(sys, "modules", {**others, **fake})
+    return app, prm
+
+
+def test_writer_id_covers_every_module_in_closure(tmp_path, monkeypatch):
+    """r16g: the closure is every radar/**/*.py on disk. Simulates `python -m radar.profile` (the writer is __main__, so NO radar.*
+    module is in sys.modules) and a lazily imported activity.py: both must still be covered."""
+    import sys
+    from radar import writer_id as W
+    app, prm = _wid_app(tmp_path)
+    monkeypatch.setattr(sys, "modules", {k: v for k, v in sys.modules.items() if not (k == "radar" or k.startswith("radar."))} | {"radar.writer_id": W})
     items = W.closure(app, prm)
+    assert [x[1] for x in items if x[0] == "module"] == ["radar/activity.py", "radar/entities.py", "radar/profile.py", "radar/vendor/v.py"]
     before = W.writer_id(items)
-    assert [x[1] for x in items if x[0] == "module"] == ["radar/entities.py", "radar/profile.py"]
-    (app / "radar" / "entities.py").write_text("# entities.py edited stop set\n")     # profile.py itself unchanged
+    (app / "radar" / "activity.py").write_text("# activity edited (never imported)\n")
     assert W.writer_id(W.closure(app, prm)) != before
+    (app / "radar" / "__pycache__" / "junk.py").write_text("# pycache edited\n")          # excluded
+    mid = W.writer_id(W.closure(app, prm))
+    assert W.writer_id(W.closure(app, prm)) == mid
+    items2 = W.closure(app, prm)
+    (app / "radar" / "profile.py").write_text("# profile.py edited mid-run\n")
     with pytest.raises(W.WriterError):
-        W.assert_unchanged(items, app, prm)                                          # drift aborts the writer
+        W.assert_unchanged(items2, app, prm)                                               # a mid-run edit of the writer aborts it
+
+
+def test_writer_id_matches_the_canonical_definition(tmp_path):
+    """Recompute from the r16g definition with independent code: entries, sort, compact ASCII JSON, sha256."""
+    import hashlib
+    import importlib.metadata
+    import json
+    import sys
+    from radar import writer_id as W
+    app, prm = _wid_app(tmp_path)
+    h = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    ent = [["module", p.relative_to(app).as_posix(), h(p)] for p in (app / "radar").rglob("*.py") if "__pycache__" not in p.parts]
+    ent += [["python", "version", sys.version], ["lockfile", "uv.lock", h(app / "uv.lock")], ["params", "params.toml", h(prm)]]
+    for lib in ("duckdb", "pyarrow", "httpx"):
+        try:
+            ent.append(["library", lib, importlib.metadata.version(lib)])
+        except importlib.metadata.PackageNotFoundError:
+            ent.append(["library", lib, "missing"])
+    body = json.dumps(sorted(ent), separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    assert b" " not in body.replace(b"(main, ", b"").split(b'"python"')[0] and not body.endswith(b"\n")
+    assert W.writer_id(W.closure(app, prm)) == hashlib.sha256(body).hexdigest()
 
 
 def test_pins_parse_and_refuse(tmp_path):
